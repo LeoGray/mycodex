@@ -1,4 +1,4 @@
-use crate::state::{PendingRequest, RepoRecord, ThreadRecord};
+use crate::state::{ApprovalRule, PendingRequest, RepoRecord, ThreadRecord};
 
 pub const TELEGRAM_MESSAGE_LIMIT: usize = 3800;
 
@@ -20,6 +20,9 @@ pub fn render_help() -> String {
         "/help",
         "/status",
         "/abort",
+        "/approval list",
+        "/approval remove <rule>",
+        "/approval clear",
         "/repo list",
         "/repo use <name>",
         "/repo clone <git_url> [dir_name]",
@@ -41,6 +44,7 @@ pub fn render_status(
     runtime_repo_id: Option<&str>,
     active_turn_id: Option<&str>,
     pending_request: Option<&PendingRequest>,
+    approval_rule_count: usize,
 ) -> String {
     let repo_line = active_repo
         .map(|repo| format!("repo: {} ({})", repo.name, repo.path.display()))
@@ -76,6 +80,7 @@ pub fn render_status(
         }
         None => "pending: none".to_string(),
     };
+    let approval_line = format!("approval rules: {approval_rule_count}");
 
     [
         repo_line,
@@ -83,6 +88,7 @@ pub fn render_status(
         runtime_line,
         turn_line,
         pending_line,
+        approval_line,
     ]
     .join("\n")
 }
@@ -123,6 +129,23 @@ pub fn render_repo_status(repo: &RepoRecord) -> String {
         format!("active thread: {}", short_id(active)),
     ]
     .join("\n")
+}
+
+pub fn render_approval_rules(repo: &RepoRecord, rules: &[&ApprovalRule]) -> String {
+    if rules.is_empty() {
+        return format!("Repo {} has no approval rules.", repo.name);
+    }
+
+    let mut lines = vec![format!("Approval rules for {}", repo.name), String::new()];
+    for (index, rule) in rules.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} [{}]",
+            index + 1,
+            trim_middle(&rule.command, 120),
+            short_id(&rule.rule_id)
+        ));
+    }
+    lines.join("\n")
 }
 
 pub fn render_thread_list(repo: &RepoRecord) -> String {

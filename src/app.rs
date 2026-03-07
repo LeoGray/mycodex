@@ -14,7 +14,9 @@ use crate::codex::protocol::{
     ThreadItem, TurnStatus,
 };
 use crate::codex::runtime::{CodexEvent, CodexRuntime};
-use crate::commands::{Command, RepoCommand, ThreadCommand, UserInput, parse_user_input};
+use crate::commands::{
+    ApprovalCommand, Command, RepoCommand, ThreadCommand, UserInput, parse_user_input,
+};
 use crate::config::{Config, TelegramAccessMode};
 use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
 use crate::state::{AppState, PendingRequest, StateStore, ThreadRecord};
@@ -23,9 +25,9 @@ use crate::telegram::api::{
     Update, default_bot_commands,
 };
 use crate::telegram::render::{
-    ProgressView, render_command_approval, render_file_approval, render_help, render_progress,
-    render_repo_list, render_repo_status, render_status, render_thread_list, render_thread_status,
-    short_id, split_message, title_from_text,
+    ProgressView, render_approval_rules, render_command_approval, render_file_approval,
+    render_help, render_progress, render_repo_list, render_repo_status, render_status,
+    render_thread_list, render_thread_status, short_id, split_message, title_from_text,
 };
 
 pub struct App {
@@ -266,23 +268,93 @@ impl App {
                     .await?;
             }
             Command::Status => {
+                let approval_rule_count = self
+                    .state
+                    .active_repo_id
+                    .as_deref()
+                    .map(|repo_id| self.state.approval_rules_for_repo(repo_id).len())
+                    .unwrap_or(0);
                 let body = render_status(
                     self.state.active_repo(),
                     self.state.active_thread(),
                     self.state.active_runtime_repo_id.as_deref(),
                     self.state.active_turn_id.as_deref(),
                     self.state.pending_request.as_ref(),
+                    approval_rule_count,
                 );
                 self.telegram.send_message(chat_id, &body, None).await?;
             }
             Command::Abort => {
                 self.abort_active_turn(chat_id).await?;
             }
+            Command::Approval(command) => {
+                self.handle_approval_command(chat_id, command).await?;
+            }
             Command::Repo(command) => {
                 self.handle_repo_command(chat_id, command).await?;
             }
             Command::Thread(command) => {
                 self.handle_thread_command(chat_id, command).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_approval_command(
+        &mut self,
+        chat_id: i64,
+        command: ApprovalCommand,
+    ) -> Result<()> {
+        let active_repo = match self.state.active_repo() {
+            Some(repo) => repo.clone(),
+            None => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "No active repo. Use /repo use or /repo clone first.",
+                        None,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        match command {
+            ApprovalCommand::List => {
+                let rules = self.state.approval_rules_for_repo(&active_repo.repo_id);
+                let body = render_approval_rules(&active_repo, &rules);
+                self.telegram.send_message(chat_id, &body, None).await?;
+            }
+            ApprovalCommand::Remove { rule } => {
+                let removed = self
+                    .state
+                    .remove_approval_rule(&active_repo.repo_id, &rule)?;
+                self.persist_state()?;
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "Removed approval rule [{}] for command:\n{}",
+                            short_id(&removed.rule_id),
+                            removed.command
+                        ),
+                        None,
+                    )
+                    .await?;
+            }
+            ApprovalCommand::Clear => {
+                let removed = self.state.clear_approval_rules(&active_repo.repo_id);
+                self.persist_state()?;
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "Cleared {} approval rule(s) for repo {}.",
+                            removed, active_repo.name
+                        ),
+                        None,
+                    )
+                    .await?;
             }
         }
         Ok(())
@@ -577,17 +649,35 @@ impl App {
 
     async fn handle_callback(&mut self, callback: CallbackQuery) -> Result<()> {
         let data = callback.data.clone().unwrap_or_default();
+        let parsed = parse_callback_action(&data);
+        if parsed.is_none() {
+            if data.starts_with("cmd:") || data.starts_with("patch:") || data.is_empty() {
+                self.mark_callback_inactive(&callback, "no longer active")
+                    .await?;
+            } else {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Unsupported action."))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let (action, callback_request_id) = parsed.expect("checked is_some above");
+
         let pending = match self.state.pending_request.clone() {
             Some(pending) => pending,
             None => {
-                self.telegram
-                    .answer_callback_query(&callback.id, Some("This approval is no longer active."))
+                self.mark_callback_inactive(&callback, "no longer active")
                     .await?;
                 return Ok(());
             }
         };
+        if pending_request_id(&pending) != &callback_request_id {
+            self.mark_callback_inactive(&callback, "no longer active")
+                .await?;
+            return Ok(());
+        }
 
-        match (pending, data.as_str()) {
+        match (pending, action.as_str()) {
             (
                 PendingRequest::CommandApproval {
                     request_id,
@@ -605,6 +695,41 @@ impl App {
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Command approved."))
                     .await?;
+                self.cleanup_pending_request(Some("approved")).await?;
+            }
+            (
+                PendingRequest::CommandApproval {
+                    request_id,
+                    repo_id,
+                    command,
+                    ..
+                },
+                "cmd:allow",
+            ) => {
+                let Some(command) = command else {
+                    self.telegram
+                        .answer_callback_query(
+                            &callback.id,
+                            Some("Only concrete commands can be saved."),
+                        )
+                        .await?;
+                    return Ok(());
+                };
+                let rule = self.state.add_approval_rule(&repo_id, command.clone());
+                self.persist_state()?;
+                self.use_repo(repo_id.clone()).await?;
+                self.ensure_runtime_for_repo(&repo_id)
+                    .await?
+                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Accept)
+                    .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Command approved and saved."))
+                    .await?;
+                self.cleanup_pending_request(Some(&format!(
+                    "approved and saved [{}]",
+                    short_id(&rule.rule_id)
+                )))
+                .await?;
             }
             (
                 PendingRequest::CommandApproval {
@@ -622,6 +747,7 @@ impl App {
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Command declined."))
                     .await?;
+                self.cleanup_pending_request(Some("declined")).await?;
             }
             (
                 PendingRequest::CommandApproval {
@@ -638,6 +764,8 @@ impl App {
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Turn abort requested."))
+                    .await?;
+                self.cleanup_pending_request(Some("abort requested"))
                     .await?;
             }
             (
@@ -656,6 +784,7 @@ impl App {
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Patch approved."))
                     .await?;
+                self.cleanup_pending_request(Some("approved")).await?;
             }
             (
                 PendingRequest::FileApproval {
@@ -673,6 +802,7 @@ impl App {
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Patch declined."))
                     .await?;
+                self.cleanup_pending_request(Some("declined")).await?;
             }
             _ => {
                 self.telegram
@@ -769,7 +899,7 @@ impl App {
                     .map(|pending| pending_request_id(pending) == &payload.request_id)
                     .unwrap_or(false)
                 {
-                    self.cleanup_pending_request().await?;
+                    self.cleanup_pending_request(Some("processed")).await?;
                 }
             }
             CodexEvent::Error { repo_id, payload } => {
@@ -823,11 +953,42 @@ impl App {
             params.command.as_deref(),
             params.reason.as_deref(),
         );
+        if let Some(command) = params.command.as_deref() {
+            if let Some(rule) = self.state.find_matching_approval_rule(&repo_id, command) {
+                let rule_id = rule.rule_id.clone();
+                self.ensure_runtime_for_repo(&repo_id)
+                    .await?
+                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Accept)
+                    .await?;
+                info!(
+                    "auto-approved command in repo {} via approval rule {}: {}",
+                    repo.name,
+                    short_id(&rule_id),
+                    command
+                );
+                return Ok(());
+            }
+        }
+        if self.state.pending_request.is_some() {
+            self.cleanup_pending_request(Some("superseded by a newer approval"))
+                .await?;
+        }
+        let approval_message = self
+            .telegram
+            .send_message(
+                chat_id,
+                &body,
+                Some(&command_approval_keyboard(&request_id)),
+            )
+            .await?;
         self.state.pending_request = Some(PendingRequest::CommandApproval {
             request_id,
             repo_id,
             thread_local_id: thread.local_thread_id,
             thread_title: thread.title,
+            approval_chat_id: chat_id,
+            approval_message_id: approval_message.message_id,
+            approval_message_text: body,
             turn_id: params.turn_id,
             item_id: params.item_id,
             command: params.command,
@@ -835,9 +996,6 @@ impl App {
             reason: params.reason,
         });
         self.persist_state()?;
-        self.telegram
-            .send_message(chat_id, &body, Some(&command_approval_keyboard()))
-            .await?;
         Ok(())
     }
 
@@ -885,21 +1043,6 @@ impl App {
             None
         };
 
-        self.state.pending_request = Some(PendingRequest::FileApproval {
-            request_id,
-            repo_id: repo_id.clone(),
-            thread_local_id: thread.local_thread_id.clone(),
-            thread_title: thread.title.clone(),
-            turn_id: params.turn_id.clone(),
-            item_id: params.item_id.clone(),
-            paths: paths.clone(),
-            reason: params.reason.clone(),
-            diff_preview: diff_preview.clone(),
-            patch_path: patch_path.clone(),
-            preferred_decision: FileChangeApprovalDecision::Accept,
-        });
-        self.persist_state()?;
-
         let caption = render_file_approval(
             &repo.name,
             &thread.title,
@@ -907,23 +1050,68 @@ impl App {
             params.reason.as_deref(),
             &diff_preview,
         );
+        if self.state.pending_request.is_some() {
+            self.cleanup_pending_request(Some("superseded by a newer approval"))
+                .await?;
+        }
 
-        if let Some(path) = patch_path {
+        let pending_request = if let Some(path) = patch_path {
             self.telegram
                 .send_document(chat_id, &path, &caption)
                 .await?;
-            self.telegram
+            let message = self
+                .telegram
                 .send_message(
                     chat_id,
                     "Use the buttons below to approve or decline this patch.",
-                    Some(&file_approval_keyboard()),
+                    Some(&file_approval_keyboard(&request_id)),
                 )
                 .await?;
+            PendingRequest::FileApproval {
+                request_id,
+                repo_id: repo_id.clone(),
+                thread_local_id: thread.local_thread_id.clone(),
+                thread_title: thread.title.clone(),
+                approval_chat_id: chat_id,
+                approval_message_id: message.message_id,
+                approval_message_text: "Use the buttons below to approve or decline this patch."
+                    .into(),
+                turn_id: params.turn_id.clone(),
+                item_id: params.item_id.clone(),
+                paths: paths.clone(),
+                reason: params.reason.clone(),
+                diff_preview: diff_preview.clone(),
+                patch_path: Some(path),
+                preferred_decision: FileChangeApprovalDecision::Accept,
+            }
         } else {
-            self.telegram
-                .send_message(chat_id, &caption, Some(&file_approval_keyboard()))
+            let message = self
+                .telegram
+                .send_message(
+                    chat_id,
+                    &caption,
+                    Some(&file_approval_keyboard(&request_id)),
+                )
                 .await?;
-        }
+            PendingRequest::FileApproval {
+                request_id,
+                repo_id: repo_id.clone(),
+                thread_local_id: thread.local_thread_id.clone(),
+                thread_title: thread.title.clone(),
+                approval_chat_id: chat_id,
+                approval_message_id: message.message_id,
+                approval_message_text: caption,
+                turn_id: params.turn_id.clone(),
+                item_id: params.item_id.clone(),
+                paths: paths.clone(),
+                reason: params.reason.clone(),
+                diff_preview: diff_preview.clone(),
+                patch_path: None,
+                preferred_decision: FileChangeApprovalDecision::Accept,
+            }
+        };
+        self.state.pending_request = Some(pending_request);
+        self.persist_state()?;
         Ok(())
     }
 
@@ -990,7 +1178,8 @@ impl App {
 
         self.state.active_turn_id = None;
         self.state.progress_message_id = None;
-        self.state.pending_request = None;
+        self.cleanup_pending_request(Some("no longer active"))
+            .await?;
         self.progress = None;
         self.active_file_changes.clear();
         self.persist_state()?;
@@ -1069,16 +1258,56 @@ impl App {
         Ok(())
     }
 
-    async fn cleanup_pending_request(&mut self) -> Result<()> {
-        if let Some(PendingRequest::FileApproval {
-            patch_path: Some(path),
-            ..
-        }) = self.state.pending_request.as_ref()
-        {
-            let _ = tokio::fs::remove_file(path).await;
+    async fn cleanup_pending_request(&mut self, status: Option<&str>) -> Result<()> {
+        if let Some(pending) = self.state.pending_request.clone() {
+            if let Some(status) = status {
+                if let Err(err) = self.update_pending_request_message(&pending, status).await {
+                    warn!("failed to update pending approval message: {err}");
+                }
+            }
+            if let PendingRequest::FileApproval {
+                patch_path: Some(path),
+                ..
+            } = &pending
+            {
+                let _ = tokio::fs::remove_file(path).await;
+            }
         }
         self.state.pending_request = None;
         self.persist_state()?;
+        Ok(())
+    }
+
+    async fn update_pending_request_message(
+        &self,
+        pending: &PendingRequest,
+        status: &str,
+    ) -> Result<()> {
+        let Some((chat_id, message_id, text)) = pending_request_message_meta(pending) else {
+            return Ok(());
+        };
+        let updated = approval_message_with_status(text, status);
+        self.telegram
+            .edit_message_text(chat_id, message_id, &updated, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_callback_inactive(&self, callback: &CallbackQuery, status: &str) -> Result<()> {
+        self.telegram
+            .answer_callback_query(&callback.id, Some("This approval is no longer active."))
+            .await?;
+        let Some(message) = callback.message.as_ref() else {
+            return Ok(());
+        };
+        let Some(text) = message.text.as_deref() else {
+            return Ok(());
+        };
+        let updated = approval_message_with_status(text, status);
+        let _ = self
+            .telegram
+            .edit_message_text(message.chat.id, message.message_id, &updated, None)
+            .await;
         Ok(())
     }
 
@@ -1241,35 +1470,43 @@ async fn probe_codex(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn command_approval_keyboard() -> InlineKeyboardMarkup {
+fn command_approval_keyboard(request_id: &RpcId) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![
-            InlineKeyboardButton {
-                text: "Approve once".into(),
-                callback_data: "cmd:approve".into(),
-            },
-            InlineKeyboardButton {
-                text: "Decline".into(),
-                callback_data: "cmd:decline".into(),
-            },
-            InlineKeyboardButton {
-                text: "Abort turn".into(),
-                callback_data: "cmd:abort".into(),
-            },
-        ]],
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: "Approve once".into(),
+                    callback_data: encode_callback_action("cmd:approve", request_id),
+                },
+                InlineKeyboardButton {
+                    text: "Always allow".into(),
+                    callback_data: encode_callback_action("cmd:allow", request_id),
+                },
+            ],
+            vec![
+                InlineKeyboardButton {
+                    text: "Decline".into(),
+                    callback_data: encode_callback_action("cmd:decline", request_id),
+                },
+                InlineKeyboardButton {
+                    text: "Abort turn".into(),
+                    callback_data: encode_callback_action("cmd:abort", request_id),
+                },
+            ],
+        ],
     }
 }
 
-fn file_approval_keyboard() -> InlineKeyboardMarkup {
+fn file_approval_keyboard(request_id: &RpcId) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![
             InlineKeyboardButton {
                 text: "Approve patch".into(),
-                callback_data: "patch:approve".into(),
+                callback_data: encode_callback_action("patch:approve", request_id),
             },
             InlineKeyboardButton {
                 text: "Decline patch".into(),
-                callback_data: "patch:decline".into(),
+                callback_data: encode_callback_action("patch:decline", request_id),
             },
         ]],
     }
@@ -1304,6 +1541,95 @@ fn pending_request_id(value: &PendingRequest) -> &RpcId {
         PendingRequest::CommandApproval { request_id, .. } => request_id,
         PendingRequest::FileApproval { request_id, .. } => request_id,
     }
+}
+
+fn pending_request_message_meta(value: &PendingRequest) -> Option<(i64, i64, &str)> {
+    match value {
+        PendingRequest::CommandApproval {
+            approval_chat_id,
+            approval_message_id,
+            approval_message_text,
+            ..
+        }
+        | PendingRequest::FileApproval {
+            approval_chat_id,
+            approval_message_id,
+            approval_message_text,
+            ..
+        } => Some((
+            *approval_chat_id,
+            *approval_message_id,
+            approval_message_text.as_str(),
+        )),
+    }
+}
+
+fn encode_callback_action(action: &str, request_id: &RpcId) -> String {
+    format!("{action}:{}", encode_request_id_token(request_id))
+}
+
+fn parse_callback_action(data: &str) -> Option<(String, RpcId)> {
+    let (action, encoded_request_id) = data.rsplit_once(':')?;
+    let request_id = parse_request_id_token(encoded_request_id)?;
+    Some((action.to_string(), request_id))
+}
+
+fn encode_request_id_token(request_id: &RpcId) -> String {
+    match request_id {
+        RpcId::Number(value) => format!("n{value}"),
+        RpcId::String(value) => {
+            let mut token = String::with_capacity(1 + value.len() * 2);
+            token.push('s');
+            for byte in value.as_bytes() {
+                use std::fmt::Write as _;
+                let _ = write!(&mut token, "{byte:02x}");
+            }
+            token
+        }
+    }
+}
+
+fn parse_request_id_token(encoded: &str) -> Option<RpcId> {
+    let (kind, payload) = encoded.split_at(1);
+    match kind {
+        "n" => payload.parse().ok().map(RpcId::Number),
+        "s" => {
+            let bytes = decode_hex(payload)?;
+            let text = String::from_utf8(bytes).ok()?;
+            Some(RpcId::String(text))
+        }
+        _ => None,
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chunks = value.as_bytes().chunks_exact(2);
+    for chunk in &mut chunks {
+        let text = std::str::from_utf8(chunk).ok()?;
+        let byte = u8::from_str_radix(text, 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
+}
+
+fn approval_message_with_status(text: &str, status: &str) -> String {
+    let base = text.split("\n\nStatus:").next().unwrap_or(text);
+    let suffix = format!("\n\nStatus: {status}");
+    const MAX_LEN: usize = 4_000;
+    let base_chars = base.chars().collect::<Vec<_>>();
+    let suffix_len = suffix.chars().count();
+    if base_chars.len() + suffix_len <= MAX_LEN {
+        return format!("{base}{suffix}");
+    }
+
+    let truncated_marker = "\n\n[truncated]";
+    let keep = MAX_LEN.saturating_sub(suffix_len + truncated_marker.chars().count());
+    let truncated = base_chars.into_iter().take(keep).collect::<String>();
+    format!("{truncated}{truncated_marker}{suffix}")
 }
 
 fn thread_resume_path(thread: &ThreadRecord) -> Option<PathBuf> {
@@ -1391,5 +1717,28 @@ mod tests {
 
         let found = discover_rollout_path_in_dir(dir.path(), "thread-123");
         assert_eq!(found, Some(path));
+    }
+
+    #[test]
+    fn callback_action_roundtrips_numeric_request_id() {
+        let encoded = encode_callback_action("cmd:approve", &RpcId::Number(42));
+        let parsed = parse_callback_action(&encoded);
+        assert_eq!(parsed, Some(("cmd:approve".into(), RpcId::Number(42))));
+    }
+
+    #[test]
+    fn callback_action_roundtrips_string_request_id() {
+        let encoded = encode_callback_action("patch:decline", &RpcId::String("req:abc".into()));
+        let parsed = parse_callback_action(&encoded);
+        assert_eq!(
+            parsed,
+            Some(("patch:decline".into(), RpcId::String("req:abc".into())))
+        );
+    }
+
+    #[test]
+    fn approval_message_status_replaces_existing_status_line() {
+        let rendered = approval_message_with_status("hello\n\nStatus: old", "approved");
+        assert_eq!(rendered, "hello\n\nStatus: approved");
     }
 }

@@ -10,8 +10,16 @@ pub enum Command {
     Help,
     Status,
     Abort,
+    Approval(ApprovalCommand),
     Repo(RepoCommand),
     Thread(ThreadCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalCommand {
+    List,
+    Remove { rule: String },
+    Clear,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,9 +63,23 @@ pub fn parse_user_input(text: &str) -> UserInput {
         "help" => UserInput::Command(Command::Help),
         "status" => UserInput::Command(Command::Status),
         "abort" => UserInput::Command(Command::Abort),
+        "approval" => {
+            UserInput::Command(Command::Approval(parse_approval_command(parts.collect())))
+        }
         "repo" => UserInput::Command(Command::Repo(parse_repo_command(parts.collect()))),
         "thread" => UserInput::Command(Command::Thread(parse_thread_command(parts.collect()))),
         _ => UserInput::Text(trimmed.to_string()),
+    }
+}
+
+fn parse_approval_command(args: Vec<&str>) -> ApprovalCommand {
+    match args.as_slice() {
+        ["list"] => ApprovalCommand::List,
+        ["remove", rule] => ApprovalCommand::Remove {
+            rule: (*rule).to_string(),
+        },
+        ["clear"] => ApprovalCommand::Clear,
+        _ => ApprovalCommand::List,
     }
 }
 
@@ -119,5 +141,16 @@ mod tests {
     fn parses_help_command() {
         let input = parse_user_input("/help");
         assert_eq!(input, UserInput::Command(Command::Help));
+    }
+
+    #[test]
+    fn parses_approval_remove_command() {
+        let input = parse_user_input("/approval remove 2");
+        assert_eq!(
+            input,
+            UserInput::Command(Command::Approval(ApprovalCommand::Remove {
+                rule: "2".into(),
+            }))
+        );
     }
 }

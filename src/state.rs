@@ -18,6 +18,8 @@ pub struct AppState {
     pub pending_request: Option<PendingRequest>,
     pub progress_message_id: Option<i64>,
     #[serde(default)]
+    pub approval_rules: Vec<ApprovalRule>,
+    #[serde(default)]
     pub approved_telegram_peers: Vec<ApprovedTelegramPeer>,
     #[serde(default)]
     pub pending_pairings: Vec<PairingRequest>,
@@ -82,6 +84,9 @@ pub enum PendingRequest {
         repo_id: String,
         thread_local_id: String,
         thread_title: String,
+        approval_chat_id: i64,
+        approval_message_id: i64,
+        approval_message_text: String,
         turn_id: String,
         item_id: String,
         command: Option<String>,
@@ -93,6 +98,9 @@ pub enum PendingRequest {
         repo_id: String,
         thread_local_id: String,
         thread_title: String,
+        approval_chat_id: i64,
+        approval_message_id: i64,
+        approval_message_text: String,
         turn_id: String,
         item_id: String,
         paths: Vec<String>,
@@ -101,6 +109,14 @@ pub enum PendingRequest {
         patch_path: Option<PathBuf>,
         preferred_decision: FileChangeApprovalDecision,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRule {
+    pub rule_id: String,
+    pub repo_id: String,
+    pub command: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -463,6 +479,63 @@ impl AppState {
         }
     }
 
+    pub fn approval_rules_for_repo(&self, repo_id: &str) -> Vec<&ApprovalRule> {
+        self.approval_rules
+            .iter()
+            .filter(|rule| rule.repo_id == repo_id)
+            .collect()
+    }
+
+    pub fn find_matching_approval_rule(
+        &self,
+        repo_id: &str,
+        command: &str,
+    ) -> Option<&ApprovalRule> {
+        self.approval_rules
+            .iter()
+            .find(|rule| rule.repo_id == repo_id && rule.command == command)
+    }
+
+    pub fn add_approval_rule(&mut self, repo_id: &str, command: String) -> ApprovalRule {
+        if let Some(rule) = self.find_matching_approval_rule(repo_id, &command) {
+            return rule.clone();
+        }
+
+        let rule = ApprovalRule {
+            rule_id: Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            command,
+            created_at: Utc::now(),
+        };
+        self.approval_rules.push(rule.clone());
+        rule
+    }
+
+    pub fn remove_approval_rule(&mut self, repo_id: &str, value: &str) -> Result<ApprovalRule> {
+        let index = self
+            .approval_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.repo_id == repo_id)
+            .enumerate()
+            .find_map(|(index, rule)| {
+                let (global_index, rule) = rule;
+                if approval_rule_matches(value, rule, index) {
+                    Some(global_index)
+                } else {
+                    None
+                }
+            })
+            .with_context(|| format!("approval rule not found: {value}"))?;
+        Ok(self.approval_rules.remove(index))
+    }
+
+    pub fn clear_approval_rules(&mut self, repo_id: &str) -> usize {
+        let before = self.approval_rules.len();
+        self.approval_rules.retain(|rule| rule.repo_id != repo_id);
+        before - self.approval_rules.len()
+    }
+
     pub fn remove_missing_repos(&mut self, valid_paths: &HashSet<PathBuf>) {
         let active_path = self.active_repo().map(|repo| repo.path.clone());
         self.repos.retain(|repo| valid_paths.contains(&repo.path));
@@ -487,6 +560,13 @@ fn generate_pairing_code() -> String {
         .take(8)
         .collect::<String>()
         .to_uppercase()
+}
+
+fn approval_rule_matches(value: &str, rule: &ApprovalRule, repo_rule_index: usize) -> bool {
+    if let Ok(index) = value.parse::<usize>() {
+        return index > 0 && repo_rule_index + 1 == index;
+    }
+    rule.rule_id.starts_with(value) || rule.command == value
 }
 
 #[cfg(test)]
@@ -617,6 +697,9 @@ mod tests {
                 repo_id: "repo-1".into(),
                 thread_local_id: "thread-1".into(),
                 thread_title: "demo".into(),
+                approval_chat_id: 10,
+                approval_message_id: 99,
+                approval_message_text: "approve git status".into(),
                 turn_id: "turn-1".into(),
                 item_id: "item-1".into(),
                 command: Some("git status".into()),
@@ -680,6 +763,47 @@ mod tests {
             state.repos[0].threads[1].status,
             ThreadStatusRecord::Historical
         );
+    }
+
+    #[test]
+    fn approval_rule_roundtrip() {
+        let mut state = AppState::default();
+        let rule = state.add_approval_rule("repo-1", "git status".into());
+
+        let matched = state
+            .find_matching_approval_rule("repo-1", "git status")
+            .unwrap();
+        assert_eq!(matched.rule_id, rule.rule_id);
+
+        let removed = state.remove_approval_rule("repo-1", "1").unwrap();
+        assert_eq!(removed.rule_id, rule.rule_id);
+        assert!(state.approval_rules.is_empty());
+    }
+
+    #[test]
+    fn clear_approval_rules_only_removes_rules_for_target_repo() {
+        let mut state = AppState::default();
+        state.add_approval_rule("repo-1", "git status".into());
+        state.add_approval_rule("repo-2", "git fetch origin".into());
+
+        let removed = state.clear_approval_rules("repo-1");
+
+        assert_eq!(removed, 1);
+        assert_eq!(state.approval_rules.len(), 1);
+        assert_eq!(state.approval_rules[0].repo_id, "repo-2");
+    }
+
+    #[test]
+    fn approval_rule_remove_uses_repo_local_index() {
+        let mut state = AppState::default();
+        state.add_approval_rule("repo-2", "git fetch origin".into());
+        let target = state.add_approval_rule("repo-1", "git status".into());
+
+        let removed = state.remove_approval_rule("repo-1", "1").unwrap();
+
+        assert_eq!(removed.rule_id, target.rule_id);
+        assert_eq!(state.approval_rules.len(), 1);
+        assert_eq!(state.approval_rules[0].repo_id, "repo-2");
     }
 
     #[test]
