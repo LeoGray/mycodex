@@ -318,6 +318,7 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     echo
     echo "[codex]"
     printf 'bin = "codex"\n'
+    printf 'network_access = true\n'
     echo
     echo "[state]"
     printf 'dir = "%s"\n' "$(toml_escape "${STATE_DIR}")"

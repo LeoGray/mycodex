@@ -121,6 +121,7 @@ poll_timeout_seconds = 30
 [codex]
 bin = "codex"
 # model = "gpt-5.1-codex"
+network_access = true
 
 [state]
 dir = "/var/lib/mycodex"
@@ -150,6 +151,9 @@ allow_https = true
 - `codex.model`
   - 可选
   - 如果设置，则 turn 会显式使用这个模型
+- `codex.network_access`
+  - Codex turn 沙箱是否允许联网
+  - 默认值是 `true`
 - `state.dir`
   - MyCodex 的状态目录
   - 会保存 repo/thread 映射、当前 active repo/thread、临时 patch 文件等

@@ -42,6 +42,8 @@ pub struct CodexConfig {
     #[serde(default = "default_codex_bin")]
     pub bin: String,
     pub model: Option<String>,
+    #[serde(default = "default_network_access")]
+    pub network_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +156,10 @@ fn default_telegram_access_mode() -> TelegramAccessMode {
 
 fn default_poll_timeout_seconds() -> u64 {
     30
+}
+
+fn default_network_access() -> bool {
+    true
 }
 
 fn default_stream_edit_interval_ms() -> u64 {

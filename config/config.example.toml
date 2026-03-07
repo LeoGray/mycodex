@@ -9,6 +9,7 @@ poll_timeout_seconds = 30
 [codex]
 bin = "codex"
 # model = "gpt-5.1-codex"
+network_access = true
 
 [state]
 dir = "/var/lib/mycodex"

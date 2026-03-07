@@ -630,9 +630,15 @@ impl App {
         }
 
         let model = self.config.codex.model.clone();
+        let network_access = self.config.codex.network_access;
         let runtime = self.ensure_runtime_for_repo(&repo_id).await?;
         let response = runtime
-            .start_turn(active_thread.codex_thread_id.clone(), text, model)
+            .start_turn(
+                active_thread.codex_thread_id.clone(),
+                text,
+                model,
+                network_access,
+            )
             .await?;
 
         let progress = self
@@ -836,6 +842,9 @@ impl App {
                 if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
                     return Ok(());
                 }
+                if self.state.active_turn_id.as_deref() != Some(payload.turn.id.as_str()) {
+                    return Ok(());
+                }
                 self.finish_turn(
                     &payload.turn.status,
                     payload.turn.error.as_ref().map(|e| e.message.as_str()),
@@ -921,6 +930,12 @@ impl App {
                     "codex turn error thread={} turn={} retry={}: {}",
                     payload.thread_id, payload.turn_id, payload.will_retry, payload.error.message
                 );
+                if !payload.will_retry
+                    && self.state.active_turn_id.as_deref() == Some(payload.turn_id.as_str())
+                {
+                    self.finish_turn(&TurnStatus::Failed, Some(payload.error.message.as_str()))
+                        .await?;
+                }
             }
             CodexEvent::RuntimeExited {
                 repo_id,

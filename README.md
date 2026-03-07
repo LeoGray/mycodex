@@ -121,6 +121,7 @@ poll_timeout_seconds = 30
 [codex]
 bin = "codex"
 # model = "gpt-5.1-codex"
+network_access = true
 
 [state]
 dir = "/var/lib/mycodex"
@@ -149,6 +150,9 @@ allow_https = true
   - Path or command name for the `codex` executable
 - `codex.model`
   - Optional explicit model override for turns
+- `codex.network_access`
+  - Whether Codex turn sandboxes can access the network
+  - Default is `true`
 - `state.dir`
   - MyCodex state directory
   - Stores repo/thread mappings, active repo/thread, temporary patch files, and related state

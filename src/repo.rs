@@ -207,6 +207,7 @@ mod tests {
             codex: CodexConfig {
                 bin: "codex".into(),
                 model: None,
+                network_access: true,
             },
             state: StateConfig {
                 dir: PathBuf::from("/tmp/state"),

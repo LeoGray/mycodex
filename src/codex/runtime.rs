@@ -213,6 +213,7 @@ impl CodexRuntime {
         thread_id: String,
         text: String,
         model: Option<String>,
+        network_access: bool,
     ) -> Result<TurnStartResponse> {
         let params = TurnStartParams {
             thread_id,
@@ -221,7 +222,7 @@ impl CodexRuntime {
             approval_policy: Some(AskForApproval::UnlessTrusted),
             sandbox_policy: Some(SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![self.repo_path.clone()],
-                network_access: false,
+                network_access,
             }),
             model,
             personality: Some(Personality::Pragmatic),

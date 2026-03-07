@@ -152,6 +152,7 @@ fn default_config() -> Result<Config> {
         codex: CodexConfig {
             bin: "codex".into(),
             model: None,
+            network_access: true,
         },
         state: StateConfig {
             dir: home_path.join(".local/state/mycodex"),
