@@ -1,0 +1,19 @@
+/target
+/dist
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+
+# Local agent instructions
+/AGENTS.md

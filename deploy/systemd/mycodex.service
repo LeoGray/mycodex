@@ -1,0 +1,20 @@
+[Unit]
+Description=MyCodex Telegram multi-repo gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mycodex
+Group=mycodex
+WorkingDirectory=/var/lib/mycodex
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/mycodex/mycodex.env
+ExecStart=/usr/local/bin/mycodex serve --config /etc/mycodex/config.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
