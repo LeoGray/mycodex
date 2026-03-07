@@ -22,10 +22,19 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
-    pub allowed_user_id: i64,
+    #[serde(default = "default_telegram_access_mode")]
+    pub access_mode: TelegramAccessMode,
+    pub allowed_user_id: Option<i64>,
     pub allowed_chat_id: Option<i64>,
     #[serde(default = "default_poll_timeout_seconds")]
     pub poll_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramAccessMode {
+    Pairing,
+    StaticAllowlist,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +68,16 @@ pub struct GitConfig {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load_unvalidated(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let config: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        Ok(config)
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let config = Self::load_unvalidated(path)?;
         config.validate()?;
         Ok(config)
     }
@@ -71,6 +85,13 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.telegram.bot_token.trim().is_empty() {
             bail!("telegram.bot_token must not be empty");
+        }
+        if self.telegram.access_mode == TelegramAccessMode::StaticAllowlist
+            && self.telegram.allowed_user_id.is_none()
+        {
+            bail!(
+                "telegram.allowed_user_id is required when telegram.access_mode = \"static_allowlist\""
+            );
         }
         if !self.workspace.root.is_absolute() {
             bail!("workspace.root must be an absolute path");
@@ -117,8 +138,18 @@ impl Config {
     }
 }
 
+impl TelegramAccessMode {
+    pub fn is_pairing(self) -> bool {
+        self == Self::Pairing
+    }
+}
+
 fn default_codex_bin() -> String {
     "codex".to_string()
+}
+
+fn default_telegram_access_mode() -> TelegramAccessMode {
+    TelegramAccessMode::Pairing
 }
 
 fn default_poll_timeout_seconds() -> u64 {

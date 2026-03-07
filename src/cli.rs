@@ -6,6 +6,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::config::Config;
+use crate::onboard::OnboardOptions;
+use crate::pairing::{PairingCommand, run_pairing};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,12 +23,26 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve {
-        #[arg(long)]
+        #[arg(long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     Check {
-        #[arg(long)]
+        #[arg(long, default_value_os_t = default_config_path())]
         config: PathBuf,
+    },
+    Onboard {
+        #[arg(long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[arg(long, default_value_os_t = default_env_path())]
+        env_path: PathBuf,
+        #[arg(long, default_value_os_t = default_service_path())]
+        service_path: PathBuf,
+    },
+    Pairing {
+        #[arg(long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: PairingCommand,
     },
 }
 
@@ -45,6 +61,19 @@ pub async fn run() -> Result<()> {
             config.validate()?;
             App::check(config).await
         }
+        Command::Onboard {
+            config,
+            env_path,
+            service_path,
+        } => {
+            crate::onboard::run(OnboardOptions {
+                config_path: config,
+                env_path,
+                service_path,
+            })
+            .await
+        }
+        Command::Pairing { config, command } => run_pairing(config, command),
     }
 }
 
@@ -55,4 +84,16 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .try_init();
+}
+
+fn default_config_path() -> PathBuf {
+    PathBuf::from("/etc/mycodex/config.toml")
+}
+
+fn default_env_path() -> PathBuf {
+    PathBuf::from("/etc/mycodex/mycodex.env")
+}
+
+fn default_service_path() -> PathBuf {
+    PathBuf::from("/etc/systemd/system/mycodex.service")
 }

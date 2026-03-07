@@ -115,8 +115,7 @@ root = "/srv/workspace"
 
 [telegram]
 bot_token = "123456:replace-me"
-allowed_user_id = 123456789
-allowed_chat_id = 123456789
+access_mode = "pairing"
 poll_timeout_seconds = 30
 
 [codex]
@@ -143,10 +142,9 @@ allow_https = true
   - Example: `/srv/workspace`
 - `telegram.bot_token`
   - Telegram bot token
-- `telegram.allowed_user_id`
-  - Telegram user ID allowed to control the bot
-- `telegram.allowed_chat_id`
-  - Optional extra chat restriction
+- `telegram.access_mode`
+  - Default recommended value is `pairing`
+  - In pairing mode, unknown users receive a pairing code instead of controlling the bot directly
 - `codex.bin`
   - Path or command name for the `codex` executable
 - `codex.model`
@@ -202,19 +200,16 @@ Example:
 
 ```bash
 ./scripts/install.sh \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789 \
-  --openai-api-key sk-...
+  --install-systemd
 ```
 
 This mode will:
 
 - Run `cargo build --release` from the current source tree
 - Install the release binary
-- Generate config and environment files
-- Generate the systemd unit
-- Run `mycodex check`
-- Start the service by default
+- Generate config and environment templates
+- Optionally install the systemd unit
+- Print the next onboarding command
 
 ## Scenario 2: Install From a Prebuilt Release
 
@@ -230,31 +225,20 @@ Recommended one-line install:
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
 ```
 
-When run in a real terminal, the installer now prompts for:
+This installs the binary, prepares config/state directories, optionally installs systemd, and then hands off to onboarding.
 
-- Telegram bot token
-- Telegram user ID
-- Optional OpenAI API key
-
-It defaults to the GitHub repo `LeoGray/mycodex` and the latest release.
-
-Advanced non-interactive example:
+Advanced example:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --github-repo LeoGray/mycodex \
-  --release-version latest \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+  --install-systemd
 ```
 
 You can also provide a full asset URL:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+  --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 This mode will:
@@ -262,7 +246,7 @@ This mode will:
 - Infer the Linux target triple from the current machine
 - Download the matching release archive
 - Extract the `mycodex` binary
-- Continue with the same install flow used by the source installer
+- Continue with the same install-only flow used by the source installer
 
 ### OpenClaw-Style One-Liner
 
@@ -295,7 +279,6 @@ Both installers default to:
 
 The source installer supports:
 
-- `--telegram-chat-id`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -304,12 +287,9 @@ The source installer supports:
 - `--config-path`
 - `--env-path`
 - `--service-path`
-- `--codex-bin`
-- `--codex-model`
+- `--install-systemd`
+- `--skip-systemd`
 - `--skip-build`
-- `--disable-ssh`
-- `--disable-https`
-- `--no-start`
 
 ### Common Parameters For `public/install.sh`
 
@@ -319,7 +299,6 @@ The public installer supports:
 - `--release-version`
 - `--asset-url`
 - `--target-triple`
-- `--telegram-chat-id`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -328,21 +307,14 @@ The public installer supports:
 - `--config-path`
 - `--env-path`
 - `--service-path`
-- `--codex-bin`
-- `--codex-model`
-- `--disable-ssh`
-- `--disable-https`
-- `--no-start`
+- `--install-systemd`
+- `--skip-systemd`
 
 ### Environment Variable Fallbacks
 
 Supported installer environment variables:
 
 - `MYCODEX_TELEGRAM_BOT_TOKEN`
-- `MYCODEX_TELEGRAM_USER_ID`
-- `MYCODEX_TELEGRAM_CHAT_ID`
-- `MYCODEX_CODEX_BIN`
-- `MYCODEX_CODEX_MODEL`
 - `MYCODEX_RELEASE_GITHUB_REPO`
 - `MYCODEX_RELEASE_VERSION`
 - `MYCODEX_RELEASE_ASSET_URL`
@@ -383,6 +355,57 @@ The repository now includes two GitHub Actions workflows:
   - Uploads them to GitHub Releases
 
 This is the missing piece that makes the public installer practical.
+
+## Onboarding
+
+After installation, run:
+
+```bash
+mycodex onboard
+```
+
+The onboarding flow is interactive and currently handles:
+
+- Telegram bot token validation via `getMe`
+- Workspace root selection
+  - default: `$HOME/workspace`
+  - custom path allowed
+  - create-if-missing flow
+- Optional `OPENAI_API_KEY`
+- Optional start of an installed systemd service
+
+The intended product flow is now:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+mycodex onboard
+```
+
+## Pairing
+
+MyCodex now defaults to `telegram.access_mode = "pairing"`.
+
+That means:
+
+- Unknown Telegram users do not control the bot directly
+- They receive a pairing code
+- An operator approves the code on the server
+
+Server-side commands:
+
+```bash
+mycodex pairing list
+mycodex pairing approve <CODE>
+mycodex pairing reject <CODE>
+```
+
+Typical first-time flow:
+
+1. Install MyCodex
+2. Run `mycodex onboard`
+3. Send a message to the bot from Telegram
+4. Receive a pairing code
+5. Approve it on the server with `mycodex pairing approve <CODE>`
 
 ## systemd Deployment
 
@@ -618,8 +641,8 @@ Check:
 Check:
 
 - Whether the bot token is correct
-- Whether `allowed_user_id` is correct
-- Whether `allowed_chat_id` matches the real chat
+- Whether the service was onboarded successfully
+- Whether pairing requests exist via `mycodex pairing list`
 - Whether the logs show `telegram polling failed`
 
 ### Clone Fails

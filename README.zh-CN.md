@@ -115,8 +115,7 @@ root = "/srv/workspace"
 
 [telegram]
 bot_token = "123456:replace-me"
-allowed_user_id = 123456789
-allowed_chat_id = 123456789
+access_mode = "pairing"
 poll_timeout_seconds = 30
 
 [codex]
@@ -143,11 +142,9 @@ allow_https = true
   - 例如 `/srv/workspace`
 - `telegram.bot_token`
   - Telegram Bot Token
-- `telegram.allowed_user_id`
-  - 允许控制机器人的 Telegram 用户 ID
-- `telegram.allowed_chat_id`
-  - 可选
-  - 如果设置，则会额外限制聊天 ID
+- `telegram.access_mode`
+  - 默认推荐值是 `pairing`
+  - 在 pairing 模式下，未知用户先拿 pairing code，而不是直接控制 bot
 - `codex.bin`
   - `codex` 可执行文件路径或命令名
 - `codex.model`
@@ -204,19 +201,16 @@ cargo build --release
 
 ```bash
 ./scripts/install.sh \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789 \
-  --openai-api-key sk-...
+  --install-systemd
 ```
 
 这个模式会：
 
 - 在当前源码树里执行 `cargo build --release`
 - 安装 release 二进制
-- 生成配置文件和环境变量文件
-- 生成 systemd 服务文件
-- 运行 `mycodex check`
-- 默认自动启动服务
+- 生成配置模板和环境变量模板
+- 可选安装 systemd 服务文件
+- 打印下一步 onboarding 命令
 
 ## 场景 2：从预构建 release 安装
 
@@ -232,31 +226,20 @@ cargo build --release
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
 ```
 
-如果是在真实终端里执行，安装器现在会交互式询问：
-
-- Telegram bot token
-- Telegram user ID
-- 可选的 OpenAI API key
-
-它默认使用 GitHub 仓库 `LeoGray/mycodex` 和最新 release。
+这个命令只负责安装，不负责 Telegram 产品配置。配置在下一步的 `mycodex onboard` 里完成。
 
 高级非交互示例：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --github-repo LeoGray/mycodex \
-  --release-version latest \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+  --install-systemd
 ```
 
 也可以直接指定完整下载地址：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+  --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 这个模式会：
@@ -264,7 +247,7 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 - 根据当前 Linux 架构推断目标 release 产物
 - 下载对应的压缩包
 - 解压出 `mycodex` 二进制
-- 后续安装流程和源码模式完全一致
+- 后续仍然是纯安装流程，不做 Telegram 业务配置
 
 ### OpenClaw 风格的一条命令体验
 
@@ -297,7 +280,6 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 
 源码安装脚本支持：
 
-- `--telegram-chat-id`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -306,12 +288,9 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 - `--config-path`
 - `--env-path`
 - `--service-path`
-- `--codex-bin`
-- `--codex-model`
+- `--install-systemd`
+- `--skip-systemd`
 - `--skip-build`
-- `--disable-ssh`
-- `--disable-https`
-- `--no-start`
 
 ### `public/install.sh` 常用参数
 
@@ -321,7 +300,6 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 - `--release-version`
 - `--asset-url`
 - `--target-triple`
-- `--telegram-chat-id`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -330,21 +308,14 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 - `--config-path`
 - `--env-path`
 - `--service-path`
-- `--codex-bin`
-- `--codex-model`
-- `--disable-ssh`
-- `--disable-https`
-- `--no-start`
+- `--install-systemd`
+- `--skip-systemd`
 
 ### 环境变量回退
 
 安装脚本支持这些环境变量：
 
 - `MYCODEX_TELEGRAM_BOT_TOKEN`
-- `MYCODEX_TELEGRAM_USER_ID`
-- `MYCODEX_TELEGRAM_CHAT_ID`
-- `MYCODEX_CODEX_BIN`
-- `MYCODEX_CODEX_MODEL`
 - `MYCODEX_RELEASE_GITHUB_REPO`
 - `MYCODEX_RELEASE_VERSION`
 - `MYCODEX_RELEASE_ASSET_URL`
@@ -387,14 +358,62 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 这意味着后面你可以把安装入口做成：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --github-repo LeoGray/mycodex \
-  --release-version latest \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+mycodex onboard
 ```
 
 目前 release workflow 先覆盖最常见的 x86_64 Linux 服务器。ARM64 Linux 资产后面可以再补。
+
+## Onboarding
+
+安装完成后，下一步应该运行：
+
+```bash
+mycodex onboard
+```
+
+当前 onboarding 会交互式完成这些事情：
+
+- 用 `getMe` 验证 Telegram bot token
+- 选择 workspace 路径
+  - 默认：`$HOME/workspace`
+  - 可以手动指定已有路径
+  - 如果目录不存在，可以直接创建
+- 可选填写 `OPENAI_API_KEY`
+- 如果 systemd 服务已经安装，可选立即启动
+
+现在推荐的产品流是：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+mycodex onboard
+```
+
+## Pairing
+
+MyCodex 现在默认使用 `telegram.access_mode = "pairing"`。
+
+这意味着：
+
+- 未配对的 Telegram 用户不能直接控制 bot
+- 他们只会收到 pairing code
+- 服务器管理员需要显式批准
+
+服务器侧命令：
+
+```bash
+mycodex pairing list
+mycodex pairing approve <CODE>
+mycodex pairing reject <CODE>
+```
+
+第一次使用的流程应该是：
+
+1. 安装 MyCodex
+2. 运行 `mycodex onboard`
+3. 用 Telegram 给 bot 发消息
+4. 收到 pairing code
+5. 在服务器上运行 `mycodex pairing approve <CODE>`
 
 ## systemd 部署
 
@@ -630,8 +649,8 @@ MyCodex 会在 `state.dir` 下面保存：
 优先检查：
 
 - Bot Token 是否正确
-- `allowed_user_id` 是否配置正确
-- `allowed_chat_id` 是否和实际聊天一致
+- 是否已经成功完成 onboarding
+- `mycodex pairing list` 里是否有待批准的 pairing request
 - 服务日志里有没有 `telegram polling failed`
 
 ### clone 失败

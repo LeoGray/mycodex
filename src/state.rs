@@ -17,6 +17,10 @@ pub struct AppState {
     pub active_turn_id: Option<String>,
     pub pending_request: Option<PendingRequest>,
     pub progress_message_id: Option<i64>,
+    #[serde(default)]
+    pub approved_telegram_peers: Vec<ApprovedTelegramPeer>,
+    #[serde(default)]
+    pub pending_pairings: Vec<PairingRequest>,
     pub repos: Vec<RepoRecord>,
 }
 
@@ -79,6 +83,25 @@ pub enum PendingRequest {
         patch_path: Option<PathBuf>,
         preferred_decision: FileChangeApprovalDecision,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovedTelegramPeer {
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub first_name: String,
+    pub username: Option<String>,
+    pub approved_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub code: String,
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub first_name: String,
+    pub username: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct StateStore {
@@ -212,6 +235,83 @@ impl AppState {
             .find(|thread| thread.local_thread_id == active_thread)
     }
 
+    pub fn is_peer_approved(&self, user_id: i64, chat_id: i64) -> bool {
+        self.approved_telegram_peers
+            .iter()
+            .any(|peer| peer.user_id == user_id && peer.chat_id == chat_id)
+    }
+
+    pub fn ensure_pairing_request(
+        &mut self,
+        user_id: i64,
+        chat_id: i64,
+        first_name: String,
+        username: Option<String>,
+    ) -> PairingRequest {
+        if let Some(existing) = self
+            .pending_pairings
+            .iter()
+            .find(|request| request.user_id == user_id && request.chat_id == chat_id)
+        {
+            return existing.clone();
+        }
+
+        let request = PairingRequest {
+            code: generate_pairing_code(),
+            user_id,
+            chat_id,
+            first_name,
+            username,
+            created_at: Utc::now(),
+        };
+        self.pending_pairings.push(request.clone());
+        request
+    }
+
+    pub fn list_pairing_requests(&self) -> &[PairingRequest] {
+        &self.pending_pairings
+    }
+
+    pub fn list_approved_peers(&self) -> &[ApprovedTelegramPeer] {
+        &self.approved_telegram_peers
+    }
+
+    pub fn approve_pairing_code(&mut self, code: &str) -> Result<ApprovedTelegramPeer> {
+        let index = self
+            .pending_pairings
+            .iter()
+            .position(|request| request.code.eq_ignore_ascii_case(code))
+            .with_context(|| format!("pairing code not found: {code}"))?;
+        let request = self.pending_pairings.remove(index);
+
+        if let Some(existing) = self
+            .approved_telegram_peers
+            .iter()
+            .find(|peer| peer.user_id == request.user_id && peer.chat_id == request.chat_id)
+        {
+            return Ok(existing.clone());
+        }
+
+        let approved = ApprovedTelegramPeer {
+            user_id: request.user_id,
+            chat_id: request.chat_id,
+            first_name: request.first_name,
+            username: request.username,
+            approved_at: Utc::now(),
+        };
+        self.approved_telegram_peers.push(approved.clone());
+        Ok(approved)
+    }
+
+    pub fn reject_pairing_code(&mut self, code: &str) -> Result<PairingRequest> {
+        let index = self
+            .pending_pairings
+            .iter()
+            .position(|request| request.code.eq_ignore_ascii_case(code))
+            .with_context(|| format!("pairing code not found: {code}"))?;
+        Ok(self.pending_pairings.remove(index))
+    }
+
     pub fn resolve_thread_ref<'a>(
         &'a self,
         repo: &'a RepoRecord,
@@ -314,6 +414,16 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn generate_pairing_code() -> String {
+    Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_uppercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +495,16 @@ mod tests {
         assert!(state.active_turn_id.is_none());
         assert!(state.pending_request.is_none());
         assert!(state.progress_message_id.is_none());
+    }
+
+    #[test]
+    fn pairing_request_roundtrip() {
+        let mut state = AppState::default();
+        let request = state.ensure_pairing_request(1, 10, "Leo".into(), Some("leogray".into()));
+        assert_eq!(state.list_pairing_requests().len(), 1);
+        let approved = state.approve_pairing_code(&request.code).unwrap();
+        assert_eq!(approved.user_id, 1);
+        assert!(state.is_peer_approved(1, 10));
+        assert!(state.list_pairing_requests().is_empty());
     }
 }

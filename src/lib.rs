@@ -3,6 +3,8 @@ pub mod cli;
 pub mod codex;
 pub mod commands;
 pub mod config;
+pub mod onboard;
+pub mod pairing;
 pub mod repo;
 pub mod state;
 pub mod telegram;

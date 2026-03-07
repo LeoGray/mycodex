@@ -168,7 +168,8 @@ fn sanitize_repo_name(name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        CodexConfig, GitConfig, StateConfig, TelegramConfig, UiConfig, WorkspaceConfig,
+        CodexConfig, GitConfig, StateConfig, TelegramAccessMode, TelegramConfig, UiConfig,
+        WorkspaceConfig,
     };
 
     #[test]
@@ -198,7 +199,8 @@ mod tests {
             },
             telegram: TelegramConfig {
                 bot_token: "token".into(),
-                allowed_user_id: 1,
+                access_mode: TelegramAccessMode::StaticAllowlist,
+                allowed_user_id: Some(1),
                 allowed_chat_id: Some(1),
                 poll_timeout_seconds: 30,
             },

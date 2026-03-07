@@ -13,7 +13,7 @@ use crate::codex::protocol::{
 };
 use crate::codex::runtime::{CodexEvent, CodexRuntime};
 use crate::commands::{Command, RepoCommand, ThreadCommand, UserInput, parse_user_input};
-use crate::config::Config;
+use crate::config::{Config, TelegramAccessMode};
 use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
 use crate::state::{AppState, PendingRequest, StateStore};
 use crate::telegram::api::{
@@ -154,52 +154,89 @@ impl App {
 
     async fn handle_update(&mut self, update: Update) -> Result<()> {
         if let Some(message) = update.message {
-            if !self.is_allowed_message(&message) {
-                return Ok(());
-            }
-            if let Some(text) = message.text.clone() {
-                self.handle_message(message.chat.id, text).await?;
-            }
+            self.handle_incoming_message(message).await?;
             return Ok(());
         }
 
         if let Some(callback) = update.callback_query {
-            if !self.is_allowed_callback(&callback) {
-                return Ok(());
-            }
-            self.handle_callback(callback).await?;
+            self.handle_incoming_callback(callback).await?;
         }
 
         Ok(())
     }
 
-    fn is_allowed_message(&self, message: &TelegramMessage) -> bool {
+    async fn handle_incoming_message(&mut self, message: TelegramMessage) -> Result<()> {
+        match self.message_access(&message) {
+            MessageAccess::Allowed => {
+                if let Some(text) = message.text.clone() {
+                    self.handle_message(message.chat.id, text).await?;
+                }
+            }
+            MessageAccess::NeedsPairing => {
+                self.handle_pairing_message(&message).await?;
+            }
+            MessageAccess::Denied => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_incoming_callback(&mut self, callback: CallbackQuery) -> Result<()> {
+        if !self.is_allowed_callback(&callback) {
+            return Ok(());
+        }
+        self.handle_callback(callback).await
+    }
+
+    fn message_access(&self, message: &TelegramMessage) -> MessageAccess {
         let from = match &message.from {
             Some(from) => from,
-            None => return false,
+            None => return MessageAccess::Denied,
         };
-        if from.id != self.config.telegram.allowed_user_id {
-            return false;
-        }
-        if let Some(chat_id) = self.config.telegram.allowed_chat_id {
-            if message.chat.id != chat_id {
-                return false;
+        match self.config.telegram.access_mode {
+            TelegramAccessMode::StaticAllowlist => {
+                if self.config.telegram.allowed_user_id != Some(from.id) {
+                    return MessageAccess::Denied;
+                }
+                if let Some(chat_id) = self.config.telegram.allowed_chat_id {
+                    if message.chat.id != chat_id {
+                        return MessageAccess::Denied;
+                    }
+                }
+                MessageAccess::Allowed
+            }
+            TelegramAccessMode::Pairing => {
+                if self.state.is_peer_approved(from.id, message.chat.id) {
+                    MessageAccess::Allowed
+                } else {
+                    MessageAccess::NeedsPairing
+                }
             }
         }
-        true
     }
 
     fn is_allowed_callback(&self, callback: &CallbackQuery) -> bool {
-        if callback.from.id != self.config.telegram.allowed_user_id {
-            return false;
-        }
-        if let Some(chat_id) = self.config.telegram.allowed_chat_id {
-            let callback_chat = callback.message.as_ref().map(|message| message.chat.id);
-            if callback_chat != Some(chat_id) {
-                return false;
+        match self.config.telegram.access_mode {
+            TelegramAccessMode::StaticAllowlist => {
+                if self.config.telegram.allowed_user_id != Some(callback.from.id) {
+                    return false;
+                }
+                if let Some(chat_id) = self.config.telegram.allowed_chat_id {
+                    let callback_chat = callback.message.as_ref().map(|message| message.chat.id);
+                    if callback_chat != Some(chat_id) {
+                        return false;
+                    }
+                }
+                true
             }
+            TelegramAccessMode::Pairing => callback
+                .message
+                .as_ref()
+                .map(|message| {
+                    self.state
+                        .is_peer_approved(callback.from.id, message.chat.id)
+                })
+                .unwrap_or(false),
         }
-        true
     }
 
     async fn handle_message(&mut self, chat_id: i64, text: String) -> Result<()> {
@@ -1081,6 +1118,29 @@ impl App {
             .allowed_chat_id
             .context("no active chat id available")
     }
+
+    async fn handle_pairing_message(&mut self, message: &TelegramMessage) -> Result<()> {
+        let from = message
+            .from
+            .as_ref()
+            .context("pairing message is missing sender information")?;
+        let request = self.state.ensure_pairing_request(
+            from.id,
+            message.chat.id,
+            from.first_name.clone(),
+            from.username.clone(),
+        );
+        self.persist_state()?;
+
+        let body = format!(
+            "Pairing required.\n\nCode: {}\n\nApprove it on the server with:\nmycodex pairing approve {}",
+            request.code, request.code
+        );
+        self.telegram
+            .send_message(message.chat.id, &body, None)
+            .await?;
+        Ok(())
+    }
 }
 
 async fn probe_codex(config: &Config) -> Result<()> {
@@ -1159,4 +1219,10 @@ fn pending_request_id(value: &PendingRequest) -> &RpcId {
         PendingRequest::CommandApproval { request_id, .. } => request_id,
         PendingRequest::FileApproval { request_id, .. } => request_id,
     }
+}
+
+enum MessageAccess {
+    Allowed,
+    NeedsPairing,
+    Denied,
 }
