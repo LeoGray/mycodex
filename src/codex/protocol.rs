@@ -179,8 +179,9 @@ pub enum SandboxMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum SandboxPolicy {
+    #[serde(rename_all = "camelCase")]
     WorkspaceWrite {
         writable_roots: Vec<PathBuf>,
         network_access: bool,
@@ -396,5 +397,34 @@ impl ThreadItem {
             Self::FileChange { id, .. } => Some(id),
             Self::Other => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sandbox_mode_serializes_as_kebab_case() {
+        let value = serde_json::to_value(SandboxMode::WorkspaceWrite).unwrap();
+        assert_eq!(value, json!("workspace-write"));
+    }
+
+    #[test]
+    fn sandbox_policy_serializes_as_camel_case_object() {
+        let value = serde_json::to_value(SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![PathBuf::from("/tmp/repo")],
+            network_access: false,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/tmp/repo"],
+                "networkAccess": false
+            })
+        );
     }
 }
