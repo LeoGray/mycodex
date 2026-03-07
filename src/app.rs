@@ -153,6 +153,8 @@ impl App {
     }
 
     async fn handle_update(&mut self, update: Update) -> Result<()> {
+        self.reload_pairing_state().ok();
+
         if let Some(message) = update.message {
             self.handle_incoming_message(message).await?;
             return Ok(());
@@ -1107,6 +1109,13 @@ impl App {
 
     fn persist_state(&self) -> Result<()> {
         self.state_store.save(&self.state)
+    }
+
+    fn reload_pairing_state(&mut self) -> Result<()> {
+        let disk_state = self.state_store.load()?;
+        self.state.approved_telegram_peers = disk_state.approved_telegram_peers;
+        self.state.pending_pairings = disk_state.pending_pairings;
+        Ok(())
     }
 
     fn active_chat_id(&self) -> Result<i64> {
