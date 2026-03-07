@@ -161,6 +161,17 @@ impl App {
 
     async fn handle_update(&mut self, update: Update) -> Result<()> {
         self.reload_pairing_state().ok();
+        let chat_id = update
+            .message
+            .as_ref()
+            .map(|message| message.chat.id)
+            .or_else(|| {
+                update
+                    .callback_query
+                    .as_ref()
+                    .and_then(|callback| callback.message.as_ref().map(|message| message.chat.id))
+            });
+        self.reconcile_runtime_exit(chat_id).await?;
 
         if let Some(message) = update.message {
             self.handle_incoming_message(message).await?;
@@ -1275,6 +1286,102 @@ impl App {
         }
         self.state.pending_request = None;
         self.persist_state()?;
+        Ok(())
+    }
+
+    async fn reconcile_runtime_exit(&mut self, chat_id: Option<i64>) -> Result<()> {
+        let exit_status = match self.runtime.as_mut() {
+            Some(runtime) => runtime.try_wait()?,
+            None => None,
+        };
+        let Some(exit_status) = exit_status else {
+            return Ok(());
+        };
+
+        let runtime = self
+            .runtime
+            .take()
+            .context("runtime must exist after try_wait")?;
+        let repo_id = runtime.repo_id().to_string();
+        let repo_name = self
+            .state
+            .find_repo_by_id(&repo_id)
+            .map(|repo| repo.name.clone())
+            .unwrap_or_else(|| repo_id.clone());
+        let progress_snapshot = self.progress.clone();
+        let had_pending_request = self.state.pending_request.is_some();
+        let had_active_turn = self.state.active_turn_id.is_some() || progress_snapshot.is_some();
+        let _ = runtime.stop().await;
+
+        if self.state.active_runtime_repo_id.as_deref() == Some(repo_id.as_str()) {
+            self.state.active_runtime_repo_id = None;
+        }
+
+        if let Some(progress) = progress_snapshot.as_ref() {
+            let repo_label = self
+                .state
+                .find_repo_by_id(&progress.repo_id)
+                .map(|repo| repo.name.clone())
+                .unwrap_or_else(|| progress.repo_id.clone());
+            let thread_label = self
+                .state
+                .find_repo_by_id(&progress.repo_id)
+                .and_then(|repo| {
+                    repo.threads
+                        .iter()
+                        .find(|thread| thread.local_thread_id == progress.thread_local_id)
+                })
+                .map(|thread| thread.title.clone())
+                .unwrap_or_else(|| progress.thread_local_id.clone());
+            let _ = self
+                .telegram
+                .edit_message_text(
+                    progress.chat_id,
+                    progress.message_id,
+                    &format!("repo: {repo_label}\nthread: {thread_label}\nstatus: runtime exited"),
+                    None,
+                )
+                .await;
+        }
+
+        if had_pending_request {
+            self.cleanup_pending_request(Some("no longer active"))
+                .await?;
+        }
+
+        self.state.active_turn_id = None;
+        self.state.progress_message_id = None;
+        self.progress = None;
+        self.active_file_changes.clear();
+        self.persist_state()?;
+
+        warn!(
+            "codex runtime exited for repo {} status={:?}; cleared active turn state",
+            repo_id,
+            exit_status.code()
+        );
+
+        if had_active_turn || had_pending_request {
+            let notify_chat_id = chat_id
+                .or_else(|| progress_snapshot.as_ref().map(|progress| progress.chat_id))
+                .or(self.config.telegram.allowed_chat_id);
+            if let Some(chat_id) = notify_chat_id {
+                let status = exit_status
+                    .code()
+                    .map(|code| format!("status {code}"))
+                    .unwrap_or_else(|| "an unknown status".to_string());
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "Codex runtime exited unexpectedly for repo {repo_name} ({status}). Cleared the stuck turn; send your message again."
+                        ),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 

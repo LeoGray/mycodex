@@ -160,6 +160,12 @@ impl CodexRuntime {
         &self.repo_path
     }
 
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        self.child
+            .try_wait()
+            .context("failed to poll codex runtime process")
+    }
+
     pub async fn stop(mut self) -> Result<()> {
         if let Err(err) = self.child.kill().await {
             warn!(
