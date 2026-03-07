@@ -35,6 +35,22 @@ pub struct RepoRecord {
     pub last_used_at: DateTime<Utc>,
 }
 
+impl RepoRecord {
+    pub fn active_thread(&self) -> Option<&ThreadRecord> {
+        let active_thread = self.active_thread_local_id.as_ref()?;
+        self.threads
+            .iter()
+            .find(|thread| &thread.local_thread_id == active_thread)
+    }
+
+    pub fn active_thread_mut(&mut self) -> Option<&mut ThreadRecord> {
+        let active_thread = self.active_thread_local_id.clone()?;
+        self.threads
+            .iter_mut()
+            .find(|thread| thread.local_thread_id == active_thread)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadRecord {
     pub local_thread_id: String,
@@ -220,19 +236,11 @@ impl AppState {
     }
 
     pub fn active_thread(&self) -> Option<&ThreadRecord> {
-        let repo = self.active_repo()?;
-        let active_thread = repo.active_thread_local_id.as_ref()?;
-        repo.threads
-            .iter()
-            .find(|thread| &thread.local_thread_id == active_thread)
+        self.active_repo()?.active_thread()
     }
 
     pub fn active_thread_mut(&mut self) -> Option<&mut ThreadRecord> {
-        let repo = self.active_repo_mut()?;
-        let active_thread = repo.active_thread_local_id.clone()?;
-        repo.threads
-            .iter_mut()
-            .find(|thread| thread.local_thread_id == active_thread)
+        self.active_repo_mut()?.active_thread_mut()
     }
 
     pub fn is_peer_approved(&self, user_id: i64, chat_id: i64) -> bool {
@@ -319,13 +327,22 @@ impl AppState {
     ) -> Option<&'a ThreadRecord> {
         if let Ok(index) = value.parse::<usize>() {
             if index > 0 {
-                return repo.threads.get(index - 1);
+                if let Some(thread) = repo.threads.get(index - 1) {
+                    return Some(thread);
+                }
             }
         }
         if let Some(thread) = repo
             .threads
             .iter()
             .find(|thread| thread.local_thread_id.starts_with(value))
+        {
+            return Some(thread);
+        }
+        if let Some(thread) = repo
+            .threads
+            .iter()
+            .find(|thread| thread.codex_thread_id.starts_with(value))
         {
             return Some(thread);
         }
@@ -468,6 +485,73 @@ mod tests {
 
         let resolved = state.resolve_thread_ref(&repo, "2").unwrap();
         assert_eq!(resolved.local_thread_id, "t-2");
+    }
+
+    #[test]
+    fn thread_resolution_falls_back_to_local_id_prefix_for_numeric_values() {
+        let repo = RepoRecord {
+            repo_id: "repo-1".into(),
+            name: "alpha".into(),
+            path: PathBuf::from("/tmp/alpha"),
+            origin_url: None,
+            active_thread_local_id: Some("81764991-54e9-42e7-bad6-e1625025156e".into()),
+            threads: vec![ThreadRecord {
+                local_thread_id: "81764991-54e9-42e7-bad6-e1625025156e".into(),
+                codex_thread_id: "019cc8e5-d151-7811-834f-a6eaa5e2ede8".into(),
+                repo_id: "repo-1".into(),
+                title: "hello".into(),
+                status: ThreadStatusRecord::Active,
+                created_at: Utc::now(),
+                last_used_at: Utc::now(),
+                has_user_message: true,
+            }],
+            last_used_at: Utc::now(),
+        };
+        let state = AppState::default();
+
+        let resolved = state.resolve_thread_ref(&repo, "81764991").unwrap();
+        assert_eq!(
+            resolved.local_thread_id,
+            "81764991-54e9-42e7-bad6-e1625025156e"
+        );
+    }
+
+    #[test]
+    fn repo_active_thread_resolves_from_active_thread_local_id() {
+        let repo = RepoRecord {
+            repo_id: "repo-1".into(),
+            name: "alpha".into(),
+            path: PathBuf::from("/tmp/alpha"),
+            origin_url: None,
+            active_thread_local_id: Some("t-2".into()),
+            threads: vec![
+                ThreadRecord {
+                    local_thread_id: "t-1".into(),
+                    codex_thread_id: "thr-1".into(),
+                    repo_id: "repo-1".into(),
+                    title: "first".into(),
+                    status: ThreadStatusRecord::Historical,
+                    created_at: Utc::now(),
+                    last_used_at: Utc::now(),
+                    has_user_message: true,
+                },
+                ThreadRecord {
+                    local_thread_id: "t-2".into(),
+                    codex_thread_id: "thr-2".into(),
+                    repo_id: "repo-1".into(),
+                    title: "second".into(),
+                    status: ThreadStatusRecord::Active,
+                    created_at: Utc::now(),
+                    last_used_at: Utc::now(),
+                    has_user_message: true,
+                },
+            ],
+            last_used_at: Utc::now(),
+        };
+
+        let resolved = repo.active_thread().unwrap();
+        assert_eq!(resolved.local_thread_id, "t-2");
+        assert_eq!(resolved.codex_thread_id, "thr-2");
     }
 
     #[test]

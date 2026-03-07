@@ -1100,13 +1100,31 @@ impl App {
             .find_repo_by_id(repo_id)
             .cloned()
             .with_context(|| format!("repo not found: {repo_id}"))?;
-        let runtime = CodexRuntime::start(
+        let active_thread = repo.active_thread().cloned();
+        let mut runtime = CodexRuntime::start(
             &self.config.codex.bin,
             repo.repo_id.clone(),
             repo.path.clone(),
             self.codex_events_tx.clone(),
         )
         .await?;
+        if let Some(thread) = active_thread {
+            let model = self.config.codex.model.clone();
+            if let Err(err) = runtime
+                .resume_thread(thread.codex_thread_id.clone(), model)
+                .await
+            {
+                let _ = runtime.stop().await;
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resume active thread {} [{}] for repo {}",
+                        thread.title,
+                        short_id(&thread.local_thread_id),
+                        repo.name
+                    )
+                });
+            }
+        }
         self.state.active_runtime_repo_id = Some(repo.repo_id.clone());
         self.persist_state()?;
         self.runtime = Some(runtime);
