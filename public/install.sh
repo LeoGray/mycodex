@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_GITHUB_REPO="${MYCODEX_DEFAULT_GITHUB_REPO:-}"
+DEFAULT_GITHUB_REPO="${MYCODEX_DEFAULT_GITHUB_REPO:-LeoGray/mycodex}"
 RELEASE_VERSION="${MYCODEX_RELEASE_VERSION:-latest}"
 RELEASE_ASSET_URL="${MYCODEX_RELEASE_ASSET_URL:-}"
 RELEASE_TARGET_TRIPLE="${MYCODEX_RELEASE_TARGET_TRIPLE:-}"
@@ -35,12 +35,19 @@ TEMP_DIR=""
 usage() {
   cat <<'EOF'
 Usage:
-  curl -fsSL https://your-domain.example/install.sh | bash -s -- [options]
+  curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- [options]
 
 This installer is for users who do not need to clone the repository.
 It downloads a prebuilt MyCodex release and installs it on Linux.
 
-Required:
+Interactive prompts:
+  If you run the installer without options in a real terminal, it will prompt for:
+  - Telegram bot token
+  - Telegram user ID
+  - Optional OpenAI API key
+
+Required for fully non-interactive use:
   --telegram-bot-token TOKEN
   --telegram-user-id ID
 
@@ -111,6 +118,60 @@ run_as_user() {
 
 toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+has_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+prompt_required() {
+  local var_name="$1"
+  local label="$2"
+  local secret="${3:-false}"
+  local current_value="${!var_name:-}"
+  if [[ -n "${current_value}" ]]; then
+    return
+  fi
+  has_tty || die "missing required value for ${var_name}; pass it as an option when running non-interactively"
+
+  local value=""
+  while [[ -z "${value}" ]]; do
+    if [[ "${secret}" == "true" ]]; then
+      printf '%s: ' "${label}" > /dev/tty
+      IFS= read -r -s value < /dev/tty
+      printf '\n' > /dev/tty
+    else
+      printf '%s: ' "${label}" > /dev/tty
+      IFS= read -r value < /dev/tty
+    fi
+  done
+  printf -v "${var_name}" '%s' "${value}"
+}
+
+prompt_optional() {
+  local var_name="$1"
+  local label="$2"
+  local secret="${3:-false}"
+  local current_value="${!var_name:-}"
+  if [[ -n "${current_value}" ]]; then
+    return
+  fi
+  if ! has_tty; then
+    return
+  fi
+
+  local value=""
+  if [[ "${secret}" == "true" ]]; then
+    printf '%s (press Enter to skip): ' "${label}" > /dev/tty
+    IFS= read -r -s value < /dev/tty
+    printf '\n' > /dev/tty
+  else
+    printf '%s (press Enter to skip): ' "${label}" > /dev/tty
+    IFS= read -r value < /dev/tty
+  fi
+  if [[ -n "${value}" ]]; then
+    printf -v "${var_name}" '%s' "${value}"
+  fi
 }
 
 detect_target_triple() {
@@ -291,8 +352,10 @@ if [[ "${EUID}" -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
   die "sudo is required when not running as root"
 fi
 
-[[ -n "${TELEGRAM_BOT_TOKEN}" ]] || die "--telegram-bot-token is required"
-[[ -n "${TELEGRAM_USER_ID}" ]] || die "--telegram-user-id is required"
+prompt_required TELEGRAM_BOT_TOKEN "Telegram bot token" true
+prompt_required TELEGRAM_USER_ID "Telegram user ID"
+prompt_optional OPENAI_API_KEY_VALUE "OpenAI API key" true
+
 id "${RUN_USER}" >/dev/null 2>&1 || die "run user does not exist: ${RUN_USER}"
 if [[ -z "${RUN_GROUP}" ]]; then
   RUN_GROUP="$(id -gn "${RUN_USER}")"

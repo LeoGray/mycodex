@@ -226,11 +226,25 @@ cargo build --release
 - 用户只想执行一条安装命令
 - 你已经把 release 二进制发到了 GitHub Releases 或自己的下载地址
 
-示例：
+推荐的一行安装命令：
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
-  --github-repo OWNER/REPO \
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+```
+
+如果是在真实终端里执行，安装器现在会交互式询问：
+
+- Telegram bot token
+- Telegram user ID
+- 可选的 OpenAI API key
+
+它默认使用 GitHub 仓库 `LeoGray/mycodex` 和最新 release。
+
+高级非交互示例：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
+  --github-repo LeoGray/mycodex \
   --release-version latest \
   --telegram-bot-token 123456:replace-me \
   --telegram-user-id 123456789
@@ -239,7 +253,7 @@ curl -fsSL https://your-domain.example/install.sh | bash -s -- \
 也可以直接指定完整下载地址：
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
   --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz \
   --telegram-bot-token 123456:replace-me \
   --telegram-user-id 123456789
@@ -254,17 +268,13 @@ curl -fsSL https://your-domain.example/install.sh | bash -s -- \
 
 ### OpenClaw 风格的一条命令体验
 
-当你把 [public/install.sh](./public/install.sh) 放到稳定 URL 之后，就可以像 OpenClaw 那样提供一条命令：
+对于当前这个开源项目，可以直接用 GitHub Raw：
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
-  --github-repo OWNER/REPO \
-  --release-version latest \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
 ```
 
-如果你托管脚本时，把 `public/install.sh` 顶部的默认 GitHub repo 直接写死，那么最终用户连 `--github-repo` 都不用传。
+公开安装器现在已经默认指向 `LeoGray/mycodex`。如果以后你 fork 或改名，只需要改一下 `public/install.sh` 顶部的默认 GitHub repo。
 
 ### 默认行为
 
@@ -377,8 +387,8 @@ curl -fsSL https://your-domain.example/install.sh | bash -s -- \
 这意味着后面你可以把安装入口做成：
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
-  --github-repo OWNER/REPO \
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
+  --github-repo LeoGray/mycodex \
   --release-version latest \
   --telegram-bot-token 123456:replace-me \
   --telegram-user-id 123456789

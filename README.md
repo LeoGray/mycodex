@@ -224,11 +224,25 @@ Use this when:
 - You want a single install command
 - You publish release binaries to GitHub Releases or another download URL
 
-Example using a hosted installer:
+Recommended one-line install:
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
-  --github-repo OWNER/REPO \
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+```
+
+When run in a real terminal, the installer now prompts for:
+
+- Telegram bot token
+- Telegram user ID
+- Optional OpenAI API key
+
+It defaults to the GitHub repo `LeoGray/mycodex` and the latest release.
+
+Advanced non-interactive example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
+  --github-repo LeoGray/mycodex \
   --release-version latest \
   --telegram-bot-token 123456:replace-me \
   --telegram-user-id 123456789
@@ -237,7 +251,7 @@ curl -fsSL https://your-domain.example/install.sh | bash -s -- \
 You can also provide a full asset URL:
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
   --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz \
   --telegram-bot-token 123456:replace-me \
   --telegram-user-id 123456789
@@ -252,17 +266,13 @@ This mode will:
 
 ### OpenClaw-Style One-Liner
 
-Once you host [public/install.sh](./public/install.sh) at a stable URL, you can expose an OpenClaw-style install command:
+For this open-source setup, you can use GitHub Raw directly:
 
 ```bash
-curl -fsSL https://your-domain.example/install.sh | bash -s -- \
-  --github-repo OWNER/REPO \
-  --release-version latest \
-  --telegram-bot-token 123456:replace-me \
-  --telegram-user-id 123456789
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
 ```
 
-If you hardcode the default GitHub repo near the top of `public/install.sh` before hosting it, users will not need to pass `--github-repo`.
+The public installer already defaults to `LeoGray/mycodex`. If you fork or rebrand the project, update the default GitHub repo near the top of `public/install.sh`.
 
 ### Default Installer Behavior
 
