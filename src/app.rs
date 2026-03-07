@@ -18,7 +18,7 @@ use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
 use crate::state::{AppState, PendingRequest, StateStore};
 use crate::telegram::api::{
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramMessage,
-    Update,
+    Update, default_bot_commands,
 };
 use crate::telegram::render::{
     ProgressView, render_command_approval, render_file_approval, render_help, render_progress,
@@ -68,6 +68,9 @@ impl App {
         state_store.save(&state)?;
 
         let telegram = TelegramClient::new(&config.telegram.bot_token);
+        if let Err(err) = telegram.set_my_commands(&default_bot_commands()).await {
+            warn!("failed to register Telegram bot commands: {err}");
+        }
         let (codex_events_tx, codex_events_rx) = mpsc::channel(256);
 
         let mut app = Self {
@@ -251,6 +254,11 @@ impl App {
     async fn handle_command(&mut self, chat_id: i64, command: Command) -> Result<()> {
         match command {
             Command::Start => {
+                self.telegram
+                    .send_message(chat_id, &render_help(), None)
+                    .await?;
+            }
+            Command::Help => {
                 self.telegram
                     .send_message(chat_id, &render_help(), None)
                     .await?;

@@ -7,6 +7,7 @@ pub enum UserInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Start,
+    Help,
     Status,
     Abort,
     Repo(RepoCommand),
@@ -51,6 +52,7 @@ pub fn parse_user_input(text: &str) -> UserInput {
 
     match command {
         "start" => UserInput::Command(Command::Start),
+        "help" => UserInput::Command(Command::Help),
         "status" => UserInput::Command(Command::Status),
         "abort" => UserInput::Command(Command::Abort),
         "repo" => UserInput::Command(Command::Repo(parse_repo_command(parts.collect()))),
@@ -111,5 +113,11 @@ mod tests {
     fn falls_back_to_text_for_unknown_command() {
         let input = parse_user_input("/hello world");
         assert_eq!(input, UserInput::Text("/hello world".into()));
+    }
+
+    #[test]
+    fn parses_help_command() {
+        let input = parse_user_input("/help");
+        assert_eq!(input, UserInput::Command(Command::Help));
     }
 }

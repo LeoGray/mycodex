@@ -10,7 +10,7 @@ use crate::config::{
     CodexConfig, Config, GitConfig, StateConfig, TelegramAccessMode, TelegramConfig, UiConfig,
     WorkspaceConfig,
 };
-use crate::telegram::api::TelegramClient;
+use crate::telegram::api::{TelegramClient, default_bot_commands};
 
 pub struct OnboardOptions {
     pub config_path: PathBuf,
@@ -48,6 +48,10 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
         "Connected to Telegram bot: {}",
         me.username.unwrap_or(me.first_name)
     );
+    match telegram.set_my_commands(&default_bot_commands()).await {
+        Ok(()) => println!("Registered Telegram bot commands."),
+        Err(err) => eprintln!("Warning: failed to register Telegram bot commands: {err}"),
+    }
 
     let default_workspace = config.workspace.root.clone();
     let workspace_input = prompt_with_default(

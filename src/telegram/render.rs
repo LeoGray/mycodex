@@ -17,6 +17,7 @@ pub fn render_help() -> String {
         "MyCodex commands",
         "",
         "/start",
+        "/help",
         "/status",
         "/abort",
         "/repo list",

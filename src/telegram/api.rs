@@ -60,6 +60,12 @@ pub struct InlineKeyboardMarkup {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InlineKeyboardButton {
     pub text: String,
     pub callback_data: String,
@@ -96,6 +102,11 @@ struct AnswerCallbackQueryRequest<'a> {
     text: Option<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct SetMyCommandsRequest<'a> {
+    commands: &'a [BotCommand],
+}
+
 impl TelegramClient {
     pub fn new(bot_token: &str) -> Self {
         Self {
@@ -116,6 +127,12 @@ impl TelegramClient {
             allowed_updates: vec!["message", "callback_query"],
         };
         self.post_json("getUpdates", &req).await
+    }
+
+    pub async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<()> {
+        let req = SetMyCommandsRequest { commands };
+        let _: bool = self.post_json("setMyCommands", &req).await?;
+        Ok(())
     }
 
     pub async fn send_message(
@@ -230,6 +247,35 @@ fn decode_response<T>(method: &str, response: TelegramResponse<T>) -> Result<T> 
     response
         .result
         .with_context(|| format!("telegram {method} response missing result"))
+}
+
+pub fn default_bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand {
+            command: "start".into(),
+            description: "Show help and available commands".into(),
+        },
+        BotCommand {
+            command: "help".into(),
+            description: "Show help and available commands".into(),
+        },
+        BotCommand {
+            command: "status".into(),
+            description: "Show current repo, thread, and runtime status".into(),
+        },
+        BotCommand {
+            command: "abort".into(),
+            description: "Abort the active Codex turn".into(),
+        },
+        BotCommand {
+            command: "repo".into(),
+            description: "Repo commands: list, use, clone, status, rescan".into(),
+        },
+        BotCommand {
+            command: "thread".into(),
+            description: "Thread commands: list, new, use, status".into(),
+        },
+    ]
 }
 
 #[cfg(test)]
