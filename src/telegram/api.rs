@@ -20,7 +20,6 @@ pub struct TelegramResponse<T> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TelegramUser {
     pub id: i64,
     pub first_name: String,
@@ -231,4 +230,24 @@ fn decode_response<T>(method: &str, response: TelegramResponse<T>) -> Result<T> 
     response
         .result
         .with_context(|| format!("telegram {method} response missing result"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_user_deserializes_snake_case_fields() {
+        let raw = serde_json::json!({
+            "id": 123456,
+            "is_bot": true,
+            "first_name": "MyCodex",
+            "username": "mycodex_bot"
+        });
+        let user: TelegramUser =
+            serde_json::from_value(raw).expect("telegram user should deserialize");
+        assert_eq!(user.id, 123456);
+        assert_eq!(user.first_name, "MyCodex");
+        assert_eq!(user.username.as_deref(), Some("mycodex_bot"));
+    }
 }
