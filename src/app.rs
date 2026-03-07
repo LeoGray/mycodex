@@ -1137,6 +1137,26 @@ impl App {
             {
                 Ok(response) => response,
                 Err(err) => {
+                    if is_missing_thread_resume_error(&err) {
+                        let cleared = self.state.clear_active_thread(repo_id)?;
+                        warn!(
+                            "failed to resume active thread {} [{}] for repo {}: {}; cleared active thread and continuing with a fresh runtime",
+                            cleared
+                                .as_ref()
+                                .map(|thread| thread.title.as_str())
+                                .unwrap_or(thread.title.as_str()),
+                            short_id(&thread.local_thread_id),
+                            repo.name,
+                            err
+                        );
+                        self.state.active_runtime_repo_id = Some(repo.repo_id.clone());
+                        self.persist_state()?;
+                        self.runtime = Some(runtime);
+                        return self
+                            .runtime
+                            .as_mut()
+                            .context("runtime must exist after startup");
+                    }
                     let _ = runtime.stop().await;
                     return Err(err).with_context(|| {
                         format!(
@@ -1315,6 +1335,18 @@ fn discover_rollout_path_in_dir(dir: &Path, thread_id: &str) -> Option<PathBuf> 
         }
     }
     None
+}
+
+fn is_missing_thread_resume_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    [
+        "thread not found",
+        "no rollout found",
+        "failed to load rollout",
+        "No such file or directory",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 enum MessageAccess {

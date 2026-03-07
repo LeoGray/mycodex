@@ -412,6 +412,27 @@ impl AppState {
         Ok(())
     }
 
+    pub fn clear_active_thread(&mut self, repo_id: &str) -> Result<Option<ThreadRecord>> {
+        let repo = self
+            .find_repo_by_id_mut(repo_id)
+            .with_context(|| format!("repo not found: {repo_id}"))?;
+        let active_thread_id = match repo.active_thread_local_id.take() {
+            Some(active_thread_id) => active_thread_id,
+            None => return Ok(None),
+        };
+        let thread = repo
+            .threads
+            .iter_mut()
+            .find(|thread| thread.local_thread_id == active_thread_id);
+        if let Some(thread) = thread {
+            if thread.status == ThreadStatusRecord::Active {
+                thread.status = ThreadStatusRecord::Historical;
+            }
+            return Ok(Some(thread.clone()));
+        }
+        Ok(None)
+    }
+
     pub fn activate_thread(&mut self, repo_id: &str, local_thread_id: &str) -> Result<()> {
         let repo = self
             .find_repo_by_id_mut(repo_id)
@@ -611,6 +632,54 @@ mod tests {
         assert!(state.active_turn_id.is_none());
         assert!(state.pending_request.is_none());
         assert!(state.progress_message_id.is_none());
+    }
+
+    #[test]
+    fn clear_active_thread_unsets_repo_active_thread() {
+        let mut state = AppState {
+            repos: vec![RepoRecord {
+                repo_id: "repo-1".into(),
+                name: "alpha".into(),
+                path: PathBuf::from("/tmp/alpha"),
+                origin_url: None,
+                active_thread_local_id: Some("t-2".into()),
+                threads: vec![
+                    ThreadRecord {
+                        local_thread_id: "t-1".into(),
+                        codex_thread_id: "thr-1".into(),
+                        codex_thread_path: None,
+                        repo_id: "repo-1".into(),
+                        title: "first".into(),
+                        status: ThreadStatusRecord::Historical,
+                        created_at: Utc::now(),
+                        last_used_at: Utc::now(),
+                        has_user_message: true,
+                    },
+                    ThreadRecord {
+                        local_thread_id: "t-2".into(),
+                        codex_thread_id: "thr-2".into(),
+                        codex_thread_path: None,
+                        repo_id: "repo-1".into(),
+                        title: "second".into(),
+                        status: ThreadStatusRecord::Active,
+                        created_at: Utc::now(),
+                        last_used_at: Utc::now(),
+                        has_user_message: true,
+                    },
+                ],
+                last_used_at: Utc::now(),
+            }],
+            ..AppState::default()
+        };
+
+        let cleared = state.clear_active_thread("repo-1").unwrap().unwrap();
+
+        assert_eq!(cleared.local_thread_id, "t-2");
+        assert!(state.repos[0].active_thread_local_id.is_none());
+        assert_eq!(
+            state.repos[0].threads[1].status,
+            ThreadStatusRecord::Historical
+        );
     }
 
     #[test]
