@@ -211,6 +211,12 @@ This mode will:
 - Optionally install the systemd unit
 - Print the next onboarding command
 
+If an existing installation is detected, the script automatically switches to update mode:
+
+- It keeps the existing config and env files
+- It reuses the current systemd choice
+- It restarts the service automatically if that service is already active
+
 ## Scenario 2: Install From a Prebuilt Release
 
 Use this when:
@@ -248,6 +254,12 @@ This mode will:
 - Extract the `mycodex` binary
 - Continue with the same install-only flow used by the source installer
 
+If an existing installation is detected, the public installer automatically switches to update mode:
+
+- It keeps the current install layout
+- It does not ask again whether systemd should be installed
+- It restarts the service automatically if it is already active
+
 ### OpenClaw-Style One-Liner
 
 For this open-source setup, you can use GitHub Raw directly:
@@ -279,6 +291,7 @@ Both installers default to:
 
 The source installer supports:
 
+ - `--update`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -295,6 +308,7 @@ The source installer supports:
 
 The public installer supports:
 
+ - `--update`
 - `--github-repo`
 - `--release-version`
 - `--asset-url`

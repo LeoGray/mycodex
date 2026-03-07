@@ -18,6 +18,8 @@ RUN_GROUP=""
 RUN_HOME=""
 WORKSPACE_ROOT=""
 INSTALL_SYSTEMD=""
+UPDATE_MODE=""
+AUTO_DETECTED_UPDATE="false"
 
 TEMP_DIR=""
 
@@ -33,6 +35,7 @@ Configuration happens later via:
   mycodex onboard
 
 Optional:
+  --update
   --github-repo OWNER/REPO
   --release-version TAG_OR_latest
   --asset-url URL
@@ -161,6 +164,10 @@ while [[ $# -gt 0 ]]; do
       GITHUB_REPO_OVERRIDE="$2"
       shift 2
       ;;
+    --update)
+      UPDATE_MODE="true"
+      shift
+      ;;
     --release-version)
       RELEASE_VERSION="$2"
       shift 2
@@ -244,11 +251,29 @@ if [[ -z "${WORKSPACE_ROOT}" ]]; then
   WORKSPACE_ROOT="${RUN_HOME}/workspace"
 fi
 
-if [[ -z "${INSTALL_SYSTEMD}" ]]; then
-  if confirm "Install a systemd service file?" true; then
-    INSTALL_SYSTEMD="true"
+if [[ -z "${UPDATE_MODE}" ]]; then
+  if [[ -x "${INSTALL_BIN}" || -f "${CONFIG_PATH}" || -f "${SERVICE_PATH}" ]]; then
+    UPDATE_MODE="true"
+    AUTO_DETECTED_UPDATE="true"
+    log "detected existing installation; using update mode"
   else
-    INSTALL_SYSTEMD="false"
+    UPDATE_MODE="false"
+  fi
+fi
+
+if [[ -z "${INSTALL_SYSTEMD}" ]]; then
+  if [[ "${UPDATE_MODE}" == "true" ]]; then
+    if [[ -f "${SERVICE_PATH}" ]]; then
+      INSTALL_SYSTEMD="true"
+    else
+      INSTALL_SYSTEMD="false"
+    fi
+  else
+    if confirm "Install a systemd service file?" true; then
+      INSTALL_SYSTEMD="true"
+    else
+      INSTALL_SYSTEMD="false"
+    fi
   fi
 fi
 
@@ -355,9 +380,21 @@ if [[ "${INSTALL_SYSTEMD}" == "true" ]]; then
   fi
 fi
 
+SERVICE_NAME="$(basename "${SERVICE_PATH}")"
+if [[ "${UPDATE_MODE}" == "true" && "${INSTALL_SYSTEMD}" == "true" && -f "${SERVICE_PATH}" ]]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    if run_privileged systemctl is-active --quiet "${SERVICE_NAME}"; then
+      log "restarting active service ${SERVICE_NAME}"
+      run_privileged systemctl restart "${SERVICE_NAME}"
+    else
+      log "service ${SERVICE_NAME} is installed but not active; leaving it stopped"
+    fi
+  fi
+fi
+
 cat <<EOF
 
-MyCodex release installation complete.
+MyCodex release $( [[ "${UPDATE_MODE}" == "true" ]] && printf 'update' || printf 'installation' ) complete.
 
 Installed:
   binary:           ${INSTALL_BIN}

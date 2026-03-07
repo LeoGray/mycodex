@@ -212,6 +212,12 @@ cargo build --release
 - 可选安装 systemd 服务文件
 - 打印下一步 onboarding 命令
 
+如果脚本检测到机器上已经有安装，它会自动切换到 update 模式：
+
+- 保留现有配置和 env 文件
+- 沿用当前 systemd 方案
+- 如果服务已经在运行，会自动重启
+
 ## 场景 2：从预构建 release 安装
 
 这适合：
@@ -249,6 +255,12 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 - 解压出 `mycodex` 二进制
 - 后续仍然是纯安装流程，不做 Telegram 业务配置
 
+如果脚本检测到机器上已经有安装，它会自动切换到 update 模式：
+
+- 保留现有安装布局
+- 不会重复询问是否安装 systemd
+- 如果服务已经在运行，会自动重启
+
 ### OpenClaw 风格的一条命令体验
 
 对于当前这个开源项目，可以直接用 GitHub Raw：
@@ -280,6 +292,7 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 
 源码安装脚本支持：
 
+- `--update`
 - `--run-user`
 - `--run-group`
 - `--workspace-root`
@@ -296,6 +309,7 @@ curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install
 
 官网安装脚本支持：
 
+- `--update`
 - `--github-repo`
 - `--release-version`
 - `--asset-url`
