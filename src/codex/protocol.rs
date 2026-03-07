@@ -171,7 +171,7 @@ pub enum AskForApproval {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SandboxMode {
     ReadOnly,
     WorkspaceWrite,
@@ -179,7 +179,7 @@ pub enum SandboxMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SandboxPolicy {
     WorkspaceWrite {
         writable_roots: Vec<PathBuf>,
