@@ -55,6 +55,8 @@ impl RepoRecord {
 pub struct ThreadRecord {
     pub local_thread_id: String,
     pub codex_thread_id: String,
+    #[serde(default)]
+    pub codex_thread_path: Option<PathBuf>,
     pub repo_id: String,
     pub title: String,
     pub status: ThreadStatusRecord,
@@ -353,6 +355,7 @@ impl AppState {
         &mut self,
         repo_id: &str,
         codex_thread_id: String,
+        codex_thread_path: Option<PathBuf>,
         title: String,
         has_user_message: bool,
     ) -> Result<ThreadRecord> {
@@ -361,6 +364,7 @@ impl AppState {
         let thread = ThreadRecord {
             local_thread_id: local_thread_id.clone(),
             codex_thread_id,
+            codex_thread_path,
             repo_id: repo_id.to_string(),
             title,
             status: ThreadStatusRecord::Active,
@@ -383,6 +387,29 @@ impl AppState {
         repo.last_used_at = now;
         repo.threads.push(thread.clone());
         Ok(thread)
+    }
+
+    pub fn update_thread_runtime_metadata(
+        &mut self,
+        repo_id: &str,
+        local_thread_id: &str,
+        codex_thread_id: String,
+        codex_thread_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let repo = self
+            .find_repo_by_id_mut(repo_id)
+            .with_context(|| format!("repo not found: {repo_id}"))?;
+        let thread = repo
+            .threads
+            .iter_mut()
+            .find(|thread| thread.local_thread_id == local_thread_id)
+            .with_context(|| format!("thread not found: {local_thread_id}"))?;
+        thread.codex_thread_id = codex_thread_id;
+        if codex_thread_path.is_some() {
+            thread.codex_thread_path = codex_thread_path;
+        }
+        thread.last_used_at = Utc::now();
+        Ok(())
     }
 
     pub fn activate_thread(&mut self, repo_id: &str, local_thread_id: &str) -> Result<()> {
@@ -457,6 +484,7 @@ mod tests {
                 ThreadRecord {
                     local_thread_id: "t-1".into(),
                     codex_thread_id: "thr-1".into(),
+                    codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "first".into(),
                     status: ThreadStatusRecord::Historical,
@@ -467,6 +495,7 @@ mod tests {
                 ThreadRecord {
                     local_thread_id: "t-2".into(),
                     codex_thread_id: "thr-2".into(),
+                    codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "second".into(),
                     status: ThreadStatusRecord::Active,
@@ -498,6 +527,7 @@ mod tests {
             threads: vec![ThreadRecord {
                 local_thread_id: "81764991-54e9-42e7-bad6-e1625025156e".into(),
                 codex_thread_id: "019cc8e5-d151-7811-834f-a6eaa5e2ede8".into(),
+                codex_thread_path: None,
                 repo_id: "repo-1".into(),
                 title: "hello".into(),
                 status: ThreadStatusRecord::Active,
@@ -528,6 +558,7 @@ mod tests {
                 ThreadRecord {
                     local_thread_id: "t-1".into(),
                     codex_thread_id: "thr-1".into(),
+                    codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "first".into(),
                     status: ThreadStatusRecord::Historical,
@@ -538,6 +569,7 @@ mod tests {
                 ThreadRecord {
                     local_thread_id: "t-2".into(),
                     codex_thread_id: "thr-2".into(),
+                    codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "second".into(),
                     status: ThreadStatusRecord::Active,

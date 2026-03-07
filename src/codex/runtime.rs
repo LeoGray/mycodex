@@ -16,13 +16,13 @@ use super::protocol::{
     AgentMessageDeltaNotification, AskForApproval, ClientInfo, CommandExecutionApprovalDecision,
     CommandExecutionOutputDeltaNotification, CommandExecutionRequestApprovalParams,
     CommandExecutionRequestApprovalResponse, ErrorNotification, FileChangeApprovalDecision,
-    FileChangeRequestApprovalParams, FileChangeRequestApprovalResponse, InitializeParams,
-    InitializeResult, InitializedParams, ItemCompletedNotification, ItemStartedNotification,
-    Personality, RpcErrorResponse, RpcId, RpcNotification, RpcRequest, RpcSuccessResponse,
-    SandboxMode, SandboxPolicy, ServerRequestResolvedNotification, ThreadResumeParams,
-    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnCompletedNotification,
-    TurnDiffUpdatedNotification, TurnInputItem, TurnInterruptParams, TurnStartParams,
-    TurnStartResponse, TurnStartedNotification,
+    FileChangeRequestApprovalParams, FileChangeRequestApprovalResponse, InitializeCapabilities,
+    InitializeParams, InitializeResult, InitializedParams, ItemCompletedNotification,
+    ItemStartedNotification, Personality, RpcErrorResponse, RpcId, RpcNotification, RpcRequest,
+    RpcSuccessResponse, SandboxMode, SandboxPolicy, ServerRequestResolvedNotification,
+    ThreadResumeParams, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse,
+    TurnCompletedNotification, TurnDiffUpdatedNotification, TurnInputItem, TurnInterruptParams,
+    TurnStartParams, TurnStartResponse, TurnStartedNotification,
 };
 
 type PendingResponseMap = Arc<Mutex<HashMap<RpcId, oneshot::Sender<Result<Value>>>>>;
@@ -187,10 +187,12 @@ impl CodexRuntime {
     pub async fn resume_thread(
         &mut self,
         thread_id: String,
+        thread_path: Option<PathBuf>,
         model: Option<String>,
     ) -> Result<ThreadResumeResponse> {
         let params = ThreadResumeParams {
             thread_id,
+            path: thread_path,
             model,
             cwd: Some(self.repo_path.display().to_string()),
             approval_policy: Some(AskForApproval::UnlessTrusted),
@@ -252,6 +254,10 @@ impl CodexRuntime {
                 title: "MyCodex".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
+            capabilities: Some(InitializeCapabilities {
+                experimental_api: true,
+                opt_out_notification_methods: None,
+            }),
         };
 
         let _: InitializeResult = self.send_request("initialize", init).await?;

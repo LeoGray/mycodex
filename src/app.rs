@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -15,7 +17,7 @@ use crate::codex::runtime::{CodexEvent, CodexRuntime};
 use crate::commands::{Command, RepoCommand, ThreadCommand, UserInput, parse_user_input};
 use crate::config::{Config, TelegramAccessMode};
 use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
-use crate::state::{AppState, PendingRequest, StateStore};
+use crate::state::{AppState, PendingRequest, StateStore, ThreadRecord};
 use crate::telegram::api::{
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramMessage,
     Update, default_bot_commands,
@@ -411,6 +413,7 @@ impl App {
                 let thread = self.state.create_thread_for_repo(
                     &active_repo_id,
                     response.thread.id,
+                    response.thread.path,
                     title,
                     false,
                 )?;
@@ -451,9 +454,19 @@ impl App {
                 self.use_repo(active_repo_id.clone()).await?;
                 let model = self.config.codex.model.clone();
                 let runtime = self.ensure_runtime_for_repo(&active_repo_id).await?;
-                runtime
-                    .resume_thread(thread.codex_thread_id.clone(), model)
+                let response = runtime
+                    .resume_thread(
+                        thread.codex_thread_id.clone(),
+                        thread_resume_path(&thread),
+                        model,
+                    )
                     .await?;
+                self.state.update_thread_runtime_metadata(
+                    &active_repo_id,
+                    &thread.local_thread_id,
+                    response.thread.id,
+                    response.thread.path,
+                )?;
                 self.state
                     .activate_thread(&active_repo_id, &thread.local_thread_id)?;
                 self.persist_state()?;
@@ -516,9 +529,13 @@ impl App {
                 .create_thread(model)
                 .await?;
             let title = title_from_text(&text);
-            let thread =
-                self.state
-                    .create_thread_for_repo(&repo_id, response.thread.id, title, true)?;
+            let thread = self.state.create_thread_for_repo(
+                &repo_id,
+                response.thread.id,
+                response.thread.path,
+                title,
+                true,
+            )?;
             self.persist_state()?;
             thread
         };
@@ -1110,20 +1127,33 @@ impl App {
         .await?;
         if let Some(thread) = active_thread {
             let model = self.config.codex.model.clone();
-            if let Err(err) = runtime
-                .resume_thread(thread.codex_thread_id.clone(), model)
+            let response = match runtime
+                .resume_thread(
+                    thread.codex_thread_id.clone(),
+                    thread_resume_path(&thread),
+                    model,
+                )
                 .await
             {
-                let _ = runtime.stop().await;
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to resume active thread {} [{}] for repo {}",
-                        thread.title,
-                        short_id(&thread.local_thread_id),
-                        repo.name
-                    )
-                });
-            }
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = runtime.stop().await;
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to resume active thread {} [{}] for repo {}",
+                            thread.title,
+                            short_id(&thread.local_thread_id),
+                            repo.name
+                        )
+                    });
+                }
+            };
+            self.state.update_thread_runtime_metadata(
+                repo_id,
+                &thread.local_thread_id,
+                response.thread.id,
+                response.thread.path,
+            )?;
         }
         self.state.active_runtime_repo_id = Some(repo.repo_id.clone());
         self.persist_state()?;
@@ -1256,8 +1286,78 @@ fn pending_request_id(value: &PendingRequest) -> &RpcId {
     }
 }
 
+fn thread_resume_path(thread: &ThreadRecord) -> Option<PathBuf> {
+    thread
+        .codex_thread_path
+        .clone()
+        .or_else(|| discover_rollout_path(&thread.codex_thread_id))
+}
+
+fn discover_rollout_path(thread_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let sessions_dir = PathBuf::from(home).join(".codex").join("sessions");
+    discover_rollout_path_in_dir(&sessions_dir, thread_id)
+}
+
+fn discover_rollout_path_in_dir(dir: &Path, thread_id: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = discover_rollout_path_in_dir(&path, thread_id) {
+                return Some(found);
+            }
+            continue;
+        }
+        let file_name = path.file_name()?.to_str()?;
+        if file_name.ends_with(".jsonl") && file_name.contains(thread_id) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 enum MessageAccess {
     Allowed,
     NeedsPairing,
     Denied,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ThreadStatusRecord;
+    use tempfile::tempdir;
+
+    #[test]
+    fn thread_resume_path_prefers_stored_path() {
+        let thread = ThreadRecord {
+            local_thread_id: "local-1".into(),
+            codex_thread_id: "codex-1".into(),
+            codex_thread_path: Some(PathBuf::from("/tmp/thread.jsonl")),
+            repo_id: "repo-1".into(),
+            title: "demo".into(),
+            status: ThreadStatusRecord::Active,
+            created_at: Utc::now(),
+            last_used_at: Utc::now(),
+            has_user_message: true,
+        };
+
+        assert_eq!(
+            thread_resume_path(&thread),
+            Some(PathBuf::from("/tmp/thread.jsonl"))
+        );
+    }
+
+    #[test]
+    fn discover_rollout_path_in_dir_finds_matching_file() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("2026").join("03").join("08");
+        fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("rollout-2026-03-08T00-00-00-thread-123.jsonl");
+        fs::write(&path, b"{}").unwrap();
+
+        let found = discover_rollout_path_in_dir(dir.path(), "thread-123");
+        assert_eq!(found, Some(path));
+    }
 }

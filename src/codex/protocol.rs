@@ -56,6 +56,8 @@ pub struct RpcError {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
     pub client_info: ClientInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<InitializeCapabilities>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +66,14 @@ pub struct ClientInfo {
     pub name: String,
     pub title: String,
     pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeCapabilities {
+    pub experimental_api: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opt_out_notification_methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +104,8 @@ pub struct ThreadStartParams {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeParams {
     pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,6 +205,7 @@ pub enum SandboxPolicy {
 pub struct Thread {
     pub id: String,
     pub preview: String,
+    pub path: Option<PathBuf>,
     pub cwd: PathBuf,
     pub name: Option<String>,
 }
