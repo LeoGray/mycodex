@@ -20,19 +20,23 @@ pub fn render_help() -> String {
         "/help",
         "/status",
         "/abort",
+        "/approval",
         "/approval list",
         "/approval remove <rule>",
         "/approval clear",
+        "/repo",
         "/repo list",
         "/repo use <name>",
         "/repo clone <git_url> [dir_name]",
         "/repo status",
         "/repo rescan",
+        "/thread",
         "/thread list",
         "/thread new",
         "/thread use <thread>",
         "/thread status",
         "",
+        "Send /repo, /thread, or /approval to open a submenu.",
         "Send plain text to talk to the active repo/thread.",
     ]
     .join("\n")
@@ -259,6 +263,43 @@ pub fn render_file_approval(
         lines.push(trim_middle(diff_preview, 1600));
     }
     trim_middle(&lines.join("\n"), TELEGRAM_MESSAGE_LIMIT)
+}
+
+pub fn render_repo_menu() -> String {
+    "Choose list | use | clone | status | rescan for /repo.".to_string()
+}
+
+pub fn render_repo_use_menu(repos: &[RepoRecord]) -> String {
+    if repos.is_empty() {
+        return "No repos registered. Use /repo clone or /repo rescan.".to_string();
+    }
+    "Choose a repo for /repo use.".to_string()
+}
+
+pub fn render_repo_clone_menu() -> String {
+    "Send /repo clone <git_url> [dir_name].".to_string()
+}
+
+pub fn render_thread_menu() -> String {
+    "Choose list | new | use | status for /thread.".to_string()
+}
+
+pub fn render_thread_use_menu(repo: &RepoRecord) -> String {
+    if repo.threads.is_empty() {
+        return format!("Repo {} has no threads yet.", repo.name);
+    }
+    format!("Choose a thread in {} for /thread use.", repo.name)
+}
+
+pub fn render_approval_menu() -> String {
+    "Choose list | remove | clear for /approval.".to_string()
+}
+
+pub fn render_approval_remove_menu(repo: &RepoRecord, rules: &[&ApprovalRule]) -> String {
+    if rules.is_empty() {
+        return format!("Repo {} has no approval rules.", repo.name);
+    }
+    format!("Choose an approval rule to remove from {}.", repo.name)
 }
 
 pub fn split_message(text: &str) -> Vec<String> {

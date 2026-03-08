@@ -25,9 +25,11 @@ use crate::telegram::api::{
     Update, default_bot_commands,
 };
 use crate::telegram::render::{
-    ProgressView, render_approval_rules, render_command_approval, render_file_approval,
-    render_help, render_progress, render_repo_list, render_repo_status, render_status,
-    render_thread_list, render_thread_status, short_id, split_message, title_from_text,
+    ProgressView, render_approval_menu, render_approval_remove_menu, render_approval_rules,
+    render_command_approval, render_file_approval, render_help, render_progress,
+    render_repo_clone_menu, render_repo_list, render_repo_menu, render_repo_status,
+    render_repo_use_menu, render_status, render_thread_list, render_thread_menu,
+    render_thread_status, render_thread_use_menu, short_id, split_message, title_from_text,
 };
 
 pub struct App {
@@ -316,6 +318,17 @@ impl App {
         chat_id: i64,
         command: ApprovalCommand,
     ) -> Result<()> {
+        if matches!(command, ApprovalCommand::Menu) {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    &render_approval_menu(),
+                    Some(&approval_menu_keyboard()),
+                )
+                .await?;
+            return Ok(());
+        }
+
         let active_repo = match self.state.active_repo() {
             Some(repo) => repo.clone(),
             None => {
@@ -331,6 +344,7 @@ impl App {
         };
 
         match command {
+            ApprovalCommand::Menu => unreachable!("menu command returned early"),
             ApprovalCommand::List => {
                 let rules = self.state.approval_rules_for_repo(&active_repo.repo_id);
                 let body = render_approval_rules(&active_repo, &rules);
@@ -373,6 +387,11 @@ impl App {
 
     async fn handle_repo_command(&mut self, chat_id: i64, command: RepoCommand) -> Result<()> {
         match command {
+            RepoCommand::Menu => {
+                self.telegram
+                    .send_message(chat_id, &render_repo_menu(), Some(&repo_menu_keyboard()))
+                    .await?;
+            }
             RepoCommand::List => {
                 let body =
                     render_repo_list(&self.state.repos, self.state.active_repo_id.as_deref());
@@ -447,6 +466,17 @@ impl App {
     }
 
     async fn handle_thread_command(&mut self, chat_id: i64, command: ThreadCommand) -> Result<()> {
+        if matches!(command, ThreadCommand::Menu) {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    &render_thread_menu(),
+                    Some(&thread_menu_keyboard()),
+                )
+                .await?;
+            return Ok(());
+        }
+
         let active_repo_id = match self.state.active_repo_id.clone() {
             Some(repo_id) => repo_id,
             None => {
@@ -462,6 +492,7 @@ impl App {
         };
 
         match command {
+            ThreadCommand::Menu => unreachable!("menu command returned early"),
             ThreadCommand::List => {
                 let body = render_thread_list(
                     self.state
@@ -569,6 +600,253 @@ impl App {
         Ok(())
     }
 
+    async fn handle_menu_callback(
+        &mut self,
+        callback: CallbackQuery,
+        action: MenuAction,
+    ) -> Result<()> {
+        let message = callback
+            .message
+            .as_ref()
+            .context("menu callback missing message")?;
+        let chat_id = message.chat.id;
+        let message_id = message.message_id;
+
+        match action {
+            MenuAction::RepoRoot => {
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_repo_menu(),
+                    Some(&repo_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::RepoList => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Listing repos."))
+                    .await?;
+                self.handle_repo_command(chat_id, RepoCommand::List).await?;
+            }
+            MenuAction::RepoUseMenu => {
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_repo_use_menu(&self.state.repos),
+                    Some(&repo_use_keyboard(&self.state.repos)),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::RepoUse { repo_id } => {
+                self.handle_repo_command(chat_id, RepoCommand::Use { repo: repo_id })
+                    .await?;
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_repo_menu(),
+                    Some(&repo_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Repo switched."))
+                    .await?;
+            }
+            MenuAction::RepoCloneHelp => {
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_repo_clone_menu(),
+                    Some(&back_keyboard("menu:repo")),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::RepoStatus => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Showing repo status."))
+                    .await?;
+                self.handle_repo_command(chat_id, RepoCommand::Status)
+                    .await?;
+            }
+            MenuAction::RepoRescan => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Rescanning workspace."))
+                    .await?;
+                self.handle_repo_command(chat_id, RepoCommand::Rescan)
+                    .await?;
+            }
+            MenuAction::ThreadRoot => {
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_thread_menu(),
+                    Some(&thread_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::ThreadList => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Listing threads."))
+                    .await?;
+                self.handle_thread_command(chat_id, ThreadCommand::List)
+                    .await?;
+            }
+            MenuAction::ThreadNew => {
+                self.handle_thread_command(chat_id, ThreadCommand::New)
+                    .await?;
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_thread_menu(),
+                    Some(&thread_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Thread created."))
+                    .await?;
+            }
+            MenuAction::ThreadUseMenu => {
+                let (text, keyboard) = match self.state.active_repo_id.as_deref() {
+                    Some(repo_id) => {
+                        let repo = self
+                            .state
+                            .find_repo_by_id(repo_id)
+                            .context("active repo missing")?;
+                        (render_thread_use_menu(repo), thread_use_keyboard(repo))
+                    }
+                    None => (
+                        "No active repo. Use /repo use or /repo clone first.".to_string(),
+                        back_keyboard("menu:thread"),
+                    ),
+                };
+                self.update_menu_message(chat_id, message_id, &text, Some(&keyboard))
+                    .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::ThreadUse { thread_id } => {
+                self.handle_thread_command(chat_id, ThreadCommand::Use { thread: thread_id })
+                    .await?;
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_thread_menu(),
+                    Some(&thread_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Thread switched."))
+                    .await?;
+            }
+            MenuAction::ThreadStatus => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Showing thread status."))
+                    .await?;
+                self.handle_thread_command(chat_id, ThreadCommand::Status)
+                    .await?;
+            }
+            MenuAction::ApprovalRoot => {
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_approval_menu(),
+                    Some(&approval_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::ApprovalList => {
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Listing approval rules."))
+                    .await?;
+                self.handle_approval_command(chat_id, ApprovalCommand::List)
+                    .await?;
+            }
+            MenuAction::ApprovalRemoveMenu => {
+                let (text, keyboard) = match self.state.active_repo() {
+                    Some(repo) => {
+                        let rules = self.state.approval_rules_for_repo(&repo.repo_id);
+                        (
+                            render_approval_remove_menu(repo, &rules),
+                            approval_remove_keyboard(&rules),
+                        )
+                    }
+                    None => (
+                        "No active repo. Use /repo use or /repo clone first.".to_string(),
+                        back_keyboard("menu:approval"),
+                    ),
+                };
+                self.update_menu_message(chat_id, message_id, &text, Some(&keyboard))
+                    .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, None)
+                    .await?;
+            }
+            MenuAction::ApprovalRemove { rule_id } => {
+                self.handle_approval_command(chat_id, ApprovalCommand::Remove { rule: rule_id })
+                    .await?;
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_approval_menu(),
+                    Some(&approval_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Approval rule removed."))
+                    .await?;
+            }
+            MenuAction::ApprovalClear => {
+                self.handle_approval_command(chat_id, ApprovalCommand::Clear)
+                    .await?;
+                self.update_menu_message(
+                    chat_id,
+                    message_id,
+                    &render_approval_menu(),
+                    Some(&approval_menu_keyboard()),
+                )
+                .await?;
+                self.telegram
+                    .answer_callback_query(&callback.id, Some("Approval rules cleared."))
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn update_menu_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        keyboard: Option<&InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        match self
+            .telegram
+            .edit_message_text(chat_id, message_id, text, keyboard)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) if err.to_string().contains("message is not modified") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn handle_text(&mut self, chat_id: i64, text: String) -> Result<()> {
         if self.state.active_turn_id.is_some() {
             self.telegram
@@ -666,6 +944,9 @@ impl App {
 
     async fn handle_callback(&mut self, callback: CallbackQuery) -> Result<()> {
         let data = callback.data.clone().unwrap_or_default();
+        if let Some(action) = parse_menu_action(&data) {
+            return self.handle_menu_callback(callback, action).await;
+        }
         let parsed = parse_callback_action(&data);
         if parsed.is_none() {
             if data.starts_with("cmd:") || data.starts_with("patch:") || data.is_empty() {
@@ -1634,6 +1915,201 @@ fn file_approval_keyboard(request_id: &RpcId) -> InlineKeyboardMarkup {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuAction {
+    RepoRoot,
+    RepoList,
+    RepoUseMenu,
+    RepoUse { repo_id: String },
+    RepoCloneHelp,
+    RepoStatus,
+    RepoRescan,
+    ThreadRoot,
+    ThreadList,
+    ThreadNew,
+    ThreadUseMenu,
+    ThreadUse { thread_id: String },
+    ThreadStatus,
+    ApprovalRoot,
+    ApprovalList,
+    ApprovalRemoveMenu,
+    ApprovalRemove { rule_id: String },
+    ApprovalClear,
+}
+
+fn repo_menu_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                menu_button("list", "menu:repo:list"),
+                menu_button("use", "menu:repo:use"),
+            ],
+            vec![
+                menu_button("clone", "menu:repo:clone"),
+                menu_button("status", "menu:repo:status"),
+            ],
+            vec![menu_button("rescan", "menu:repo:rescan")],
+        ],
+    }
+}
+
+fn repo_use_keyboard(repos: &[crate::state::RepoRecord]) -> InlineKeyboardMarkup {
+    let mut rows = pack_menu_buttons(
+        repos
+            .iter()
+            .map(|repo| {
+                menu_button(
+                    &menu_label(&repo.name, &repo.repo_id),
+                    &format!("menu:repo:use:{}", repo.repo_id),
+                )
+            })
+            .collect(),
+        2,
+    );
+    rows.push(vec![menu_button("back", "menu:repo")]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+fn thread_menu_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                menu_button("list", "menu:thread:list"),
+                menu_button("new", "menu:thread:new"),
+            ],
+            vec![
+                menu_button("use", "menu:thread:use"),
+                menu_button("status", "menu:thread:status"),
+            ],
+        ],
+    }
+}
+
+fn thread_use_keyboard(repo: &crate::state::RepoRecord) -> InlineKeyboardMarkup {
+    let mut rows = pack_menu_buttons(
+        repo.threads
+            .iter()
+            .map(|thread| {
+                menu_button(
+                    &menu_label(&thread.title, &thread.local_thread_id),
+                    &format!("menu:thread:use:{}", thread.local_thread_id),
+                )
+            })
+            .collect(),
+        1,
+    );
+    rows.push(vec![menu_button("back", "menu:thread")]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+fn approval_menu_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                menu_button("list", "menu:approval:list"),
+                menu_button("remove", "menu:approval:remove"),
+            ],
+            vec![menu_button("clear", "menu:approval:clear")],
+        ],
+    }
+}
+
+fn approval_remove_keyboard(rules: &[&crate::state::ApprovalRule]) -> InlineKeyboardMarkup {
+    let mut rows = pack_menu_buttons(
+        rules
+            .iter()
+            .map(|rule| {
+                menu_button(
+                    &menu_label(&rule.command, &rule.rule_id),
+                    &format!("menu:approval:remove:{}", rule.rule_id),
+                )
+            })
+            .collect(),
+        1,
+    );
+    rows.push(vec![menu_button("back", "menu:approval")]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+fn back_keyboard(action: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![menu_button("back", action)]],
+    }
+}
+
+fn menu_button(text: &str, callback_data: &str) -> InlineKeyboardButton {
+    InlineKeyboardButton {
+        text: text.to_string(),
+        callback_data: callback_data.to_string(),
+    }
+}
+
+fn menu_label(label: &str, id: &str) -> String {
+    let trimmed = if label.chars().count() <= 24 {
+        label.to_string()
+    } else {
+        let shortened = label.chars().take(21).collect::<String>();
+        format!("{shortened}...")
+    };
+    format!("{trimmed} [{}]", short_id(id))
+}
+
+fn pack_menu_buttons(
+    buttons: Vec<InlineKeyboardButton>,
+    per_row: usize,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    for button in buttons {
+        row.push(button);
+        if row.len() == per_row {
+            rows.push(row);
+            row = Vec::new();
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+fn parse_menu_action(data: &str) -> Option<MenuAction> {
+    let parts = data.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["menu", "repo"] => Some(MenuAction::RepoRoot),
+        ["menu", "repo", "list"] => Some(MenuAction::RepoList),
+        ["menu", "repo", "use"] => Some(MenuAction::RepoUseMenu),
+        ["menu", "repo", "use", repo_id] => Some(MenuAction::RepoUse {
+            repo_id: (*repo_id).to_string(),
+        }),
+        ["menu", "repo", "clone"] => Some(MenuAction::RepoCloneHelp),
+        ["menu", "repo", "status"] => Some(MenuAction::RepoStatus),
+        ["menu", "repo", "rescan"] => Some(MenuAction::RepoRescan),
+        ["menu", "thread"] => Some(MenuAction::ThreadRoot),
+        ["menu", "thread", "list"] => Some(MenuAction::ThreadList),
+        ["menu", "thread", "new"] => Some(MenuAction::ThreadNew),
+        ["menu", "thread", "use"] => Some(MenuAction::ThreadUseMenu),
+        ["menu", "thread", "use", thread_id] => Some(MenuAction::ThreadUse {
+            thread_id: (*thread_id).to_string(),
+        }),
+        ["menu", "thread", "status"] => Some(MenuAction::ThreadStatus),
+        ["menu", "approval"] => Some(MenuAction::ApprovalRoot),
+        ["menu", "approval", "list"] => Some(MenuAction::ApprovalList),
+        ["menu", "approval", "remove"] => Some(MenuAction::ApprovalRemoveMenu),
+        ["menu", "approval", "remove", rule_id] => Some(MenuAction::ApprovalRemove {
+            rule_id: (*rule_id).to_string(),
+        }),
+        ["menu", "approval", "clear"] => Some(MenuAction::ApprovalClear),
+        _ => None,
+    }
+}
+
 fn trim_output_tail(value: &str, max_len: usize) -> String {
     if value.len() <= max_len {
         return value.to_string();
@@ -1862,5 +2338,29 @@ mod tests {
     fn approval_message_status_replaces_existing_status_line() {
         let rendered = approval_message_with_status("hello\n\nStatus: old", "approved");
         assert_eq!(rendered, "hello\n\nStatus: approved");
+    }
+
+    #[test]
+    fn parses_repo_menu_callback_action() {
+        assert_eq!(
+            parse_menu_action("menu:repo:use"),
+            Some(MenuAction::RepoUseMenu)
+        );
+        assert_eq!(
+            parse_menu_action("menu:repo:use:repo-123"),
+            Some(MenuAction::RepoUse {
+                repo_id: "repo-123".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_approval_remove_menu_callback_action() {
+        assert_eq!(
+            parse_menu_action("menu:approval:remove:rule-123"),
+            Some(MenuAction::ApprovalRemove {
+                rule_id: "rule-123".into(),
+            })
+        );
     }
 }

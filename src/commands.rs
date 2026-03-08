@@ -17,6 +17,7 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalCommand {
+    Menu,
     List,
     Remove { rule: String },
     Clear,
@@ -24,6 +25,7 @@ pub enum ApprovalCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoCommand {
+    Menu,
     List,
     Use {
         repo: String,
@@ -38,6 +40,7 @@ pub enum RepoCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadCommand {
+    Menu,
     List,
     New,
     Use { thread: String },
@@ -74,17 +77,19 @@ pub fn parse_user_input(text: &str) -> UserInput {
 
 fn parse_approval_command(args: Vec<&str>) -> ApprovalCommand {
     match args.as_slice() {
+        [] => ApprovalCommand::Menu,
         ["list"] => ApprovalCommand::List,
         ["remove", rule] => ApprovalCommand::Remove {
             rule: (*rule).to_string(),
         },
         ["clear"] => ApprovalCommand::Clear,
-        _ => ApprovalCommand::List,
+        _ => ApprovalCommand::Menu,
     }
 }
 
 fn parse_repo_command(args: Vec<&str>) -> RepoCommand {
     match args.as_slice() {
+        [] => RepoCommand::Menu,
         ["list"] => RepoCommand::List,
         ["use", repo] => RepoCommand::Use {
             repo: (*repo).to_string(),
@@ -99,19 +104,20 @@ fn parse_repo_command(args: Vec<&str>) -> RepoCommand {
         },
         ["status"] => RepoCommand::Status,
         ["rescan"] => RepoCommand::Rescan,
-        _ => RepoCommand::Status,
+        _ => RepoCommand::Menu,
     }
 }
 
 fn parse_thread_command(args: Vec<&str>) -> ThreadCommand {
     match args.as_slice() {
+        [] => ThreadCommand::Menu,
         ["list"] => ThreadCommand::List,
         ["new"] => ThreadCommand::New,
         ["use", thread] => ThreadCommand::Use {
             thread: (*thread).to_string(),
         },
         ["status"] => ThreadCommand::Status,
-        _ => ThreadCommand::Status,
+        _ => ThreadCommand::Menu,
     }
 }
 
@@ -151,6 +157,21 @@ mod tests {
             UserInput::Command(Command::Approval(ApprovalCommand::Remove {
                 rule: "2".into(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_repo_menu_without_subcommand() {
+        let input = parse_user_input("/repo");
+        assert_eq!(input, UserInput::Command(Command::Repo(RepoCommand::Menu)));
+    }
+
+    #[test]
+    fn parses_thread_menu_without_subcommand() {
+        let input = parse_user_input("/thread");
+        assert_eq!(
+            input,
+            UserInput::Command(Command::Thread(ThreadCommand::Menu))
         );
     }
 }

@@ -268,6 +268,10 @@ pub fn default_bot_commands() -> Vec<BotCommand> {
             description: "Abort the active Codex turn".into(),
         },
         BotCommand {
+            command: "approval".into(),
+            description: "Approval commands: list, remove, clear".into(),
+        },
+        BotCommand {
             command: "repo".into(),
             description: "Repo commands: list, use, clone, status, rescan".into(),
         },
