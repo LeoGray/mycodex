@@ -12,6 +12,7 @@ ENV_PATH=""
 SERVICE_PATH=""
 STATE_DIR=""
 WORKSPACE_ROOT=""
+WORKSPACE_ROOT_SET_BY_FLAG="false"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP=""
 RUN_HOME=""
@@ -21,6 +22,7 @@ UPDATE_MODE=""
 AUTO_DETECTED_UPDATE="false"
 SERVICE_MANAGER=""
 LAUNCH_SCRIPT_PATH=""
+STATE_DIR_SET_BY_FLAG="false"
 
 usage() {
   cat <<'EOF'
@@ -139,6 +141,41 @@ resolve_home_dir() {
   printf '%s\n' "${home}"
 }
 
+read_toml_string() {
+  local file="$1"
+  local section="$2"
+  local key="$3"
+
+  awk -v section="${section}" -v key="${key}" '
+    $0 ~ "^[[:space:]]*\\[" section "\\][[:space:]]*$" { in_section=1; next }
+    in_section && $0 ~ "^[[:space:]]*\\[" { exit }
+    in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { print; exit }
+  ' "${file}" | sed -E 's/^[^=]+=[[:space:]]*"//; s/"[[:space:]]*$//'
+}
+
+sync_existing_config_values() {
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    return
+  fi
+
+  local configured_workspace=""
+  local configured_state=""
+
+  if [[ "${WORKSPACE_ROOT_SET_BY_FLAG}" != "true" ]]; then
+    configured_workspace="$(read_toml_string "${CONFIG_PATH}" workspace root)"
+    if [[ -n "${configured_workspace}" ]]; then
+      WORKSPACE_ROOT="${configured_workspace}"
+    fi
+  fi
+
+  if [[ "${STATE_DIR_SET_BY_FLAG}" != "true" ]]; then
+    configured_state="$(read_toml_string "${CONFIG_PATH}" state dir)"
+    if [[ -n "${configured_state}" ]]; then
+      STATE_DIR="${configured_state}"
+    fi
+  fi
+}
+
 path_is_in_run_home() {
   local path="$1"
   [[ "${path}" == "${RUN_HOME}" || "${path}" == "${RUN_HOME}/"* ]]
@@ -235,10 +272,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --workspace-root)
       WORKSPACE_ROOT="$2"
+      WORKSPACE_ROOT_SET_BY_FLAG="true"
       shift 2
       ;;
     --state-dir)
       STATE_DIR="$2"
+      STATE_DIR_SET_BY_FLAG="true"
       shift 2
       ;;
     --install-bin)
@@ -295,6 +334,7 @@ RUN_HOME="$(resolve_home_dir "${RUN_USER}")"
 [[ -n "${RUN_HOME}" ]] || die "failed to resolve home directory for ${RUN_USER}"
 
 apply_platform_defaults
+sync_existing_config_values
 
 if [[ -z "${UPDATE_MODE}" ]]; then
   if [[ -x "${INSTALL_BIN}" || -f "${CONFIG_PATH}" || -f "${SERVICE_PATH}" ]]; then
@@ -516,8 +556,17 @@ if [[ "${SERVICE_MANAGER}" == "launchd" && "${INSTALL_SERVICE}" == "true" ]]; th
   printf '  launch script:    %s\n' "${LAUNCH_SCRIPT_PATH}"
 fi
 
-cat <<EOF
+if [[ "${UPDATE_MODE}" == "true" ]]; then
+  cat <<EOF
+
+No onboarding step is required for this update.
+Optional reconfiguration:
+  ${INSTALL_BIN} onboard --config ${CONFIG_PATH} --env-path ${ENV_PATH} --service-path ${SERVICE_PATH}
+EOF
+else
+  cat <<EOF
 
 Next step:
   ${INSTALL_BIN} onboard --config ${CONFIG_PATH} --env-path ${ENV_PATH} --service-path ${SERVICE_PATH}
 EOF
+fi

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -102,30 +102,52 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
 
     run_self_check(&options.config_path, &env_map)?;
 
-    if options.service_path.exists()
-        && confirm(
-            &format!(
-                "A {} exists at {}. Enable and start it now?",
-                platform::service_definition_name(),
-                options.service_path.display(),
-            ),
-            true,
-        )?
-    {
-        match platform::enable_and_start_service(&options.service_path) {
-            Ok(service_name) => {
+    if options.service_path.exists() {
+        let service_name = platform::service_instance_name(&options.service_path)?;
+        let should_offer_start = match platform::service_is_active(&options.service_path) {
+            Ok(true) => {
                 println!(
-                    "{} started: {}",
+                    "{} already active: {}",
                     platform::service_definition_name(),
                     service_name
                 );
+                false
             }
+            Ok(false) => true,
             Err(err) => {
-                eprintln!("Failed to start service automatically: {err}");
                 eprintln!(
-                    "Run manually: {}",
-                    platform::manual_start_hint(&options.service_path)?
+                    "Warning: failed to inspect {} status: {err}",
+                    platform::service_definition_name()
                 );
+                true
+            }
+        };
+
+        if should_offer_start
+            && confirm(
+                &format!(
+                    "A {} exists at {}. Enable and start it now?",
+                    platform::service_definition_name(),
+                    options.service_path.display(),
+                ),
+                true,
+            )?
+        {
+            match platform::enable_and_start_service(&options.service_path) {
+                Ok(service_name) => {
+                    println!(
+                        "{} started: {}",
+                        platform::service_definition_name(),
+                        service_name
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to start service automatically: {err}");
+                    eprintln!(
+                        "Run manually: {}",
+                        platform::manual_start_hint(&options.service_path)?
+                    );
+                }
             }
         }
     }
@@ -259,22 +281,50 @@ fn prompt_with_default(label: &str, default: &str, secret: bool) -> Result<Strin
 }
 
 fn prompt(label: &str, default: Option<&str>, secret: bool) -> Result<String> {
-    let mut stdout = io::stdout();
-    match default {
-        Some(default) if !secret => write!(stdout, "{label} [{default}]: ")?,
-        Some(_) => write!(stdout, "{label} [configured]: ")?,
-        None => write!(stdout, "{label}: ")?,
-    }
-    stdout.flush()?;
+    let prompt = match default {
+        Some(default) if !secret => format!("{label} [{default}]: "),
+        Some(_) => format!("{label} [configured]: "),
+        None => format!("{label}: "),
+    };
+    let value = if secret && io::stdin().is_terminal() {
+        prompt_secret(&prompt)?
+    } else {
+        let mut stdout = io::stdout();
+        write!(stdout, "{prompt}")?;
+        stdout.flush()?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let value = input.trim().to_string();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        input.trim().to_string()
+    };
     if value.is_empty() {
         Ok(default.unwrap_or_default().to_string())
     } else {
         Ok(value)
     }
+}
+
+fn prompt_secret(prompt: &str) -> Result<String> {
+    let mut stdout = io::stdout();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+
+    let echo_disabled = Command::new("stty")
+        .arg("-echo")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    let mut input = String::new();
+    let read_result = io::stdin().read_line(&mut input);
+
+    if echo_disabled {
+        let _ = Command::new("stty").arg("echo").status();
+        println!();
+    }
+
+    read_result?;
+    Ok(input.trim().to_string())
 }
 
 fn confirm(label: &str, default_yes: bool) -> Result<bool> {

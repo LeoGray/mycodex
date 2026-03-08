@@ -43,6 +43,10 @@ pub fn service_definition_name() -> &'static str {
     }
 }
 
+pub fn service_instance_name(service_path: &Path) -> Result<String> {
+    service_name(service_path)
+}
+
 pub fn enable_and_start_service(service_path: &Path) -> Result<String> {
     if cfg!(target_os = "linux") {
         let service_name = service_name(service_path)?;
@@ -54,6 +58,37 @@ pub fn enable_and_start_service(service_path: &Path) -> Result<String> {
         Ok(label)
     } else {
         bail!("automatic service startup is unsupported on this platform");
+    }
+}
+
+pub fn service_is_active(service_path: &Path) -> Result<bool> {
+    if cfg!(target_os = "linux") {
+        let service_name = service_name(service_path)?;
+        let status = if nix_like_root() {
+            let mut cmd = Command::new("systemctl");
+            cmd.arg("is-active").arg("--quiet").arg(&service_name);
+            cmd
+        } else {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("systemctl")
+                .arg("is-active")
+                .arg("--quiet")
+                .arg(&service_name);
+            cmd
+        }
+        .status()
+        .context("failed to run systemctl is-active")?;
+        Ok(status.success())
+    } else if cfg!(target_os = "macos") {
+        let service_name = service_name(service_path)?;
+        let status = Command::new("launchctl")
+            .arg("list")
+            .arg(&service_name)
+            .status()
+            .context("failed to run launchctl list")?;
+        Ok(status.success())
+    } else {
+        Ok(false)
     }
 }
 
