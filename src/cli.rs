@@ -8,6 +8,7 @@ use crate::app::App;
 use crate::config::Config;
 use crate::onboard::OnboardOptions;
 use crate::pairing::{PairingCommand, run_pairing};
+use crate::platform::{default_config_path, default_env_path, default_service_path};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,16 +85,4 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .try_init();
-}
-
-fn default_config_path() -> PathBuf {
-    PathBuf::from("/etc/mycodex/config.toml")
-}
-
-fn default_env_path() -> PathBuf {
-    PathBuf::from("/etc/mycodex/mycodex.env")
-}
-
-fn default_service_path() -> PathBuf {
-    PathBuf::from("/etc/systemd/system/mycodex.service")
 }

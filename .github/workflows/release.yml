@@ -22,16 +22,10 @@ jobs:
           gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
             gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes ""
 
-  build-linux:
+  build-release:
     needs: ensure-release
     if: always() && (needs.ensure-release.result == 'success' || needs.ensure-release.result == 'skipped')
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
 
     steps:
       - name: Checkout
@@ -41,10 +35,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          rustup target add ${{ matrix.target }}
+          rustup target add x86_64-unknown-linux-musl
 
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -56,22 +49,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: release-${{ runner.os }}-x86_64-unknown-linux-musl-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            release-${{ runner.os }}-${{ matrix.target }}-
+            release-${{ runner.os }}-x86_64-unknown-linux-musl-
             release-${{ runner.os }}-
 
       - name: Run tests
         run: cargo test
 
       - name: Package release archive
-        run: ./scripts/package-release.sh --target ${{ matrix.target }}
+        run: ./scripts/package-release.sh --target x86_64-unknown-linux-musl
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mycodex-${{ matrix.target }}
-          path: dist/mycodex-${{ matrix.target }}.tar.gz
+          name: mycodex-x86_64-unknown-linux-musl
+          path: dist/mycodex-x86_64-unknown-linux-musl.tar.gz
           if-no-files-found: error
 
       - name: Upload to GitHub release
@@ -79,4 +72,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${GITHUB_REF_NAME}" "dist/mycodex-${{ matrix.target }}.tar.gz" --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" "dist/mycodex-x86_64-unknown-linux-musl.tar.gz" --repo "${GITHUB_REPOSITORY}" --clobber

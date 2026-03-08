@@ -5,6 +5,7 @@ pub mod commands;
 pub mod config;
 pub mod onboard;
 pub mod pairing;
+pub mod platform;
 pub mod repo;
 pub mod state;
 pub mod telegram;

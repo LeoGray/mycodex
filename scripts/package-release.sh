@@ -24,6 +24,8 @@ Options:
 Examples:
   ./scripts/package-release.sh --target x86_64-unknown-linux-gnu
   ./scripts/package-release.sh --target aarch64-unknown-linux-musl
+  ./scripts/package-release.sh --target x86_64-apple-darwin
+  ./scripts/package-release.sh --target aarch64-apple-darwin
 EOF
 }
 

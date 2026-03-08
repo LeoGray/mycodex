@@ -6,21 +6,25 @@ RELEASE_VERSION="${MYCODEX_RELEASE_VERSION:-latest}"
 RELEASE_ASSET_URL="${MYCODEX_RELEASE_ASSET_URL:-}"
 RELEASE_TARGET_TRIPLE="${MYCODEX_RELEASE_TARGET_TRIPLE:-}"
 RELEASE_BINARY_NAME="mycodex"
+OFFICIAL_RELEASE_TARGET="x86_64-unknown-linux-musl"
+OS_NAME="$(uname -s)"
+SERVICE_LABEL="com.leogray.mycodex"
 
-INSTALL_BIN="/usr/local/bin/mycodex"
-CONFIG_DIR="/etc/mycodex"
-CONFIG_PATH="${CONFIG_DIR}/config.toml"
-ENV_PATH="${CONFIG_DIR}/mycodex.env"
-SERVICE_PATH="/etc/systemd/system/mycodex.service"
-STATE_DIR="/var/lib/mycodex"
+INSTALL_BIN=""
+CONFIG_PATH=""
+ENV_PATH=""
+SERVICE_PATH=""
+STATE_DIR=""
+WORKSPACE_ROOT=""
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP=""
 RUN_HOME=""
-WORKSPACE_ROOT=""
-INSTALL_SYSTEMD=""
+INSTALL_SERVICE=""
 UPDATE_MODE=""
 AUTO_DETECTED_UPDATE="false"
-
+SERVICE_MANAGER=""
+LAUNCH_SCRIPT_PATH=""
+GITHUB_REPO_OVERRIDE=""
 TEMP_DIR=""
 
 usage() {
@@ -29,10 +33,12 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
   curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- [options]
 
-This installer downloads a prebuilt MyCodex release and installs it on Linux.
+This installer downloads the official prebuilt MyCodex release for x86_64 Linux.
+For macOS or other targets, provide a self-built archive with --asset-url
+or use ./scripts/install.sh from a cloned repository.
 Configuration happens later via:
 
-  mycodex onboard
+  /path/to/mycodex onboard
 
 Optional:
   --update
@@ -48,6 +54,8 @@ Optional:
   --config-path PATH
   --env-path PATH
   --service-path PATH
+  --install-service
+  --skip-service
   --install-systemd
   --skip-systemd
   -h, --help
@@ -76,6 +84,18 @@ run_privileged() {
     "$@"
   else
     sudo "$@"
+  fi
+}
+
+run_as_user() {
+  local user="$1"
+  shift
+  if [[ "$(id -un)" == "${user}" ]]; then
+    "$@"
+  elif [[ "${EUID}" -eq 0 ]]; then
+    sudo -u "${user}" -- "$@"
+  else
+    sudo -u "${user}" -- "$@"
   fi
 }
 
@@ -111,6 +131,101 @@ toml_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e "s/'/\&apos;/g" \
+    -e 's/"/\&quot;/g'
+}
+
+resolve_home_dir() {
+  local user="$1"
+  local home=""
+
+  if command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+  elif [[ "${OS_NAME}" == "Darwin" ]] && command -v dscl >/dev/null 2>&1; then
+    home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  fi
+
+  if [[ -z "${home}" ]]; then
+    home="$(eval "printf '%s' ~${user}")"
+  fi
+
+  printf '%s\n' "${home}"
+}
+
+path_is_in_run_home() {
+  local path="$1"
+  [[ "${path}" == "${RUN_HOME}" || "${path}" == "${RUN_HOME}/"* ]]
+}
+
+install_dir() {
+  local path="$1"
+  local -a cmd=(install -d -m 0755)
+
+  if path_is_in_run_home "${path}"; then
+    cmd+=(-o "${RUN_USER}" -g "${RUN_GROUP}")
+  fi
+
+  run_privileged "${cmd[@]}" "${path}"
+}
+
+install_file() {
+  local mode="$1"
+  local src="$2"
+  local dest="$3"
+  local -a cmd=(install -m "${mode}")
+
+  if path_is_in_run_home "${dest}"; then
+    cmd+=(-o "${RUN_USER}" -g "${RUN_GROUP}")
+  fi
+
+  run_privileged "${cmd[@]}" "${src}" "${dest}"
+}
+
+service_install_prompt() {
+  if [[ "${SERVICE_MANAGER}" == "systemd" ]]; then
+    printf '%s\n' "Install a systemd service file?"
+  else
+    printf '%s\n' "Install a launchd agent plist?"
+  fi
+}
+
+apply_platform_defaults() {
+  case "${OS_NAME}" in
+    Linux)
+      SERVICE_MANAGER="systemd"
+      : "${INSTALL_BIN:=/usr/local/bin/mycodex}"
+      : "${CONFIG_PATH:=/etc/mycodex/config.toml}"
+      : "${ENV_PATH:=/etc/mycodex/mycodex.env}"
+      : "${SERVICE_PATH:=/etc/systemd/system/mycodex.service}"
+      : "${STATE_DIR:=/var/lib/mycodex}"
+      ;;
+    Darwin)
+      SERVICE_MANAGER="launchd"
+      : "${INSTALL_BIN:=/usr/local/bin/mycodex}"
+      : "${CONFIG_PATH:=${RUN_HOME}/.config/mycodex/config.toml}"
+      : "${ENV_PATH:=${RUN_HOME}/.config/mycodex/mycodex.env}"
+      : "${SERVICE_PATH:=${RUN_HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist}"
+      : "${STATE_DIR:=${RUN_HOME}/.local/state/mycodex}"
+      ;;
+    *)
+      die "unsupported operating system: ${OS_NAME}"
+      ;;
+  esac
+
+  if [[ -z "${WORKSPACE_ROOT}" ]]; then
+    WORKSPACE_ROOT="${RUN_HOME}/workspace"
+  fi
+
+  if [[ -z "${LAUNCH_SCRIPT_PATH}" && "${SERVICE_MANAGER}" == "launchd" ]]; then
+    LAUNCH_SCRIPT_PATH="$(dirname "${ENV_PATH}")/launch-mycodex.sh"
+  fi
+}
+
 detect_target_triple() {
   if [[ -n "${RELEASE_TARGET_TRIPLE}" ]]; then
     printf '%s\n' "${RELEASE_TARGET_TRIPLE}"
@@ -122,18 +237,28 @@ detect_target_triple() {
   case "${arch}" in
     x86_64|amd64) arch="x86_64" ;;
     aarch64|arm64) arch="aarch64" ;;
-    *) die "unsupported Linux architecture: ${arch}" ;;
+    *) die "unsupported architecture: ${arch}" ;;
   esac
 
-  local libc_suffix="unknown-linux-musl"
-  if command -v ldd >/dev/null 2>&1; then
-    if ldd --version 2>&1 | grep -qi 'musl'; then
-      libc_suffix="unknown-linux-musl"
-    else
-      libc_suffix="unknown-linux-gnu"
-    fi
-  fi
-  printf '%s-%s\n' "${arch}" "${libc_suffix}"
+  case "${OS_NAME}" in
+    Linux)
+      local libc_suffix="unknown-linux-musl"
+      if command -v ldd >/dev/null 2>&1; then
+        if ldd --version 2>&1 | grep -qi 'musl'; then
+          libc_suffix="unknown-linux-musl"
+        else
+          libc_suffix="unknown-linux-gnu"
+        fi
+      fi
+      printf '%s-%s\n' "${arch}" "${libc_suffix}"
+      ;;
+    Darwin)
+      printf '%s-apple-darwin\n' "${arch}"
+      ;;
+    *)
+      die "unsupported operating system: ${OS_NAME}"
+      ;;
+  esac
 }
 
 resolve_release_asset_url() {
@@ -143,12 +268,30 @@ resolve_release_asset_url() {
   fi
 
   local repo="${DEFAULT_GITHUB_REPO}"
-  if [[ -n "${GITHUB_REPO_OVERRIDE:-}" ]]; then
+  if [[ -n "${GITHUB_REPO_OVERRIDE}" ]]; then
     repo="${GITHUB_REPO_OVERRIDE}"
   fi
 
   local target
-  target="$(detect_target_triple)"
+  if [[ -z "${GITHUB_REPO_OVERRIDE}" && -z "${RELEASE_TARGET_TRIPLE}" ]]; then
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+      x86_64|amd64) ;;
+      *)
+        die "official release assets are only published for ${OFFICIAL_RELEASE_TARGET}; build locally or pass --asset-url for your own archive"
+        ;;
+    esac
+
+    if [[ "${OS_NAME}" != "Linux" ]]; then
+      die "official release assets are only published for ${OFFICIAL_RELEASE_TARGET}; use ./scripts/install.sh on macOS or pass --asset-url for a self-built archive"
+    fi
+
+    target="${OFFICIAL_RELEASE_TARGET}"
+  else
+    target="$(detect_target_triple)"
+  fi
+
   local asset_name="${RELEASE_BINARY_NAME}-${target}.tar.gz"
 
   if [[ "${RELEASE_VERSION}" == "latest" ]]; then
@@ -156,6 +299,17 @@ resolve_release_asset_url() {
   else
     printf 'https://github.com/%s/releases/download/%s/%s\n' "${repo}" "${RELEASE_VERSION}" "${asset_name}"
   fi
+}
+
+launchd_agent_loaded() {
+  printf -v cmd 'launchctl list | grep -Fq %q' "${SERVICE_LABEL}"
+  run_as_user "${RUN_USER}" bash -lc "${cmd}"
+}
+
+reload_launchd_agent() {
+  printf -v cmd 'launchctl unload %q >/dev/null 2>&1 || true; launchctl load -w %q' \
+    "${SERVICE_PATH}" "${SERVICE_PATH}"
+  run_as_user "${RUN_USER}" bash -lc "${cmd}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -202,24 +356,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --config-path)
       CONFIG_PATH="$2"
-      CONFIG_DIR="$(dirname "${CONFIG_PATH}")"
       shift 2
       ;;
     --env-path)
       ENV_PATH="$2"
-      CONFIG_DIR="$(dirname "${ENV_PATH}")"
       shift 2
       ;;
     --service-path)
       SERVICE_PATH="$2"
       shift 2
       ;;
-    --install-systemd)
-      INSTALL_SYSTEMD="true"
+    --install-service|--install-systemd)
+      INSTALL_SERVICE="true"
       shift
       ;;
-    --skip-systemd)
-      INSTALL_SYSTEMD="false"
+    --skip-service|--skip-systemd)
+      INSTALL_SERVICE="false"
       shift
       ;;
     -h|--help)
@@ -232,7 +384,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$(uname -s)" == "Linux" ]] || die "this installer only supports Linux"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 command -v install >/dev/null 2>&1 || die "install is required"
@@ -245,11 +396,10 @@ id "${RUN_USER}" >/dev/null 2>&1 || die "run user does not exist: ${RUN_USER}"
 if [[ -z "${RUN_GROUP}" ]]; then
   RUN_GROUP="$(id -gn "${RUN_USER}")"
 fi
-RUN_HOME="$(getent passwd "${RUN_USER}" | cut -d: -f6)"
+RUN_HOME="$(resolve_home_dir "${RUN_USER}")"
 [[ -n "${RUN_HOME}" ]] || die "failed to resolve home directory for ${RUN_USER}"
-if [[ -z "${WORKSPACE_ROOT}" ]]; then
-  WORKSPACE_ROOT="${RUN_HOME}/workspace"
-fi
+
+apply_platform_defaults
 
 if [[ -z "${UPDATE_MODE}" ]]; then
   if [[ -x "${INSTALL_BIN}" || -f "${CONFIG_PATH}" || -f "${SERVICE_PATH}" ]]; then
@@ -261,18 +411,18 @@ if [[ -z "${UPDATE_MODE}" ]]; then
   fi
 fi
 
-if [[ -z "${INSTALL_SYSTEMD}" ]]; then
+if [[ -z "${INSTALL_SERVICE}" ]]; then
   if [[ "${UPDATE_MODE}" == "true" ]]; then
     if [[ -f "${SERVICE_PATH}" ]]; then
-      INSTALL_SYSTEMD="true"
+      INSTALL_SERVICE="true"
     else
-      INSTALL_SYSTEMD="false"
+      INSTALL_SERVICE="false"
     fi
   else
-    if confirm "Install a systemd service file?" true; then
-      INSTALL_SYSTEMD="true"
+    if confirm "$(service_install_prompt)" true; then
+      INSTALL_SERVICE="true"
     else
-      INSTALL_SYSTEMD="false"
+      INSTALL_SERVICE="false"
     fi
   fi
 fi
@@ -293,18 +443,20 @@ BINARY_PATH="$(find "${EXTRACT_DIR}" -type f -name "${RELEASE_BINARY_NAME}" | he
 chmod +x "${BINARY_PATH}"
 
 log "installing binary to ${INSTALL_BIN}"
-run_privileged install -d -m 0755 "$(dirname "${INSTALL_BIN}")"
-run_privileged install -m 0755 "${BINARY_PATH}" "${INSTALL_BIN}"
+install_dir "$(dirname "${INSTALL_BIN}")"
+install_file 0755 "${BINARY_PATH}" "${INSTALL_BIN}"
 
 log "preparing directories"
-run_privileged install -d -m 0755 "${CONFIG_DIR}"
-run_privileged install -d -m 0755 -o "${RUN_USER}" -g "${RUN_GROUP}" "${STATE_DIR}"
-run_privileged install -d -m 0755 -o "${RUN_USER}" -g "${RUN_GROUP}" "${WORKSPACE_ROOT}"
+install_dir "$(dirname "${CONFIG_PATH}")"
+install_dir "$(dirname "${ENV_PATH}")"
+install_dir "${STATE_DIR}"
+install_dir "${WORKSPACE_ROOT}"
 
 CONFIG_TMP="$(mktemp)"
 ENV_TMP="$(mktemp)"
 SERVICE_TMP="$(mktemp)"
-trap 'rm -f "${CONFIG_TMP}" "${ENV_TMP}" "${SERVICE_TMP}"; cleanup' EXIT
+LAUNCH_SCRIPT_TMP="$(mktemp)"
+trap 'rm -f "${CONFIG_TMP}" "${ENV_TMP}" "${SERVICE_TMP}" "${LAUNCH_SCRIPT_TMP}"; cleanup' EXIT
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   {
@@ -333,7 +485,7 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     printf 'allow_https = true\n'
   } > "${CONFIG_TMP}"
   log "writing config template to ${CONFIG_PATH}"
-  run_privileged install -m 0640 -o "${RUN_USER}" -g "${RUN_GROUP}" "${CONFIG_TMP}" "${CONFIG_PATH}"
+  install_file 0640 "${CONFIG_TMP}" "${CONFIG_PATH}"
 else
   log "config already exists at ${CONFIG_PATH}, leaving it unchanged"
 fi
@@ -344,51 +496,115 @@ if [[ ! -f "${ENV_PATH}" ]]; then
     echo "# OPENAI_API_KEY=replace-me"
   } > "${ENV_TMP}"
   log "writing env template to ${ENV_PATH}"
-  run_privileged install -m 0600 -o "${RUN_USER}" -g "${RUN_GROUP}" "${ENV_TMP}" "${ENV_PATH}"
+  install_file 0600 "${ENV_TMP}" "${ENV_PATH}"
 else
   log "env file already exists at ${ENV_PATH}, leaving it unchanged"
 fi
 
-if [[ "${INSTALL_SYSTEMD}" == "true" ]]; then
-  {
-    echo "[Unit]"
-    echo "Description=MyCodex Telegram multi-repo gateway"
-    echo "After=network-online.target"
-    echo "Wants=network-online.target"
-    echo
-    echo "[Service]"
-    echo "Type=simple"
-    printf 'User=%s\n' "${RUN_USER}"
-    printf 'Group=%s\n' "${RUN_GROUP}"
-    printf 'WorkingDirectory=%s\n' "${STATE_DIR}"
-    echo "Environment=RUST_LOG=info"
-    printf 'EnvironmentFile=-%s\n' "${ENV_PATH}"
-    printf 'ExecStart=%s serve --config %s\n' "${INSTALL_BIN}" "${CONFIG_PATH}"
-    echo "Restart=always"
-    echo "RestartSec=3"
-    echo "NoNewPrivileges=true"
-    echo "PrivateTmp=true"
-    echo
-    echo "[Install]"
-    echo "WantedBy=multi-user.target"
-  } > "${SERVICE_TMP}"
-  log "installing systemd service file to ${SERVICE_PATH}"
-  run_privileged install -d -m 0755 "$(dirname "${SERVICE_PATH}")"
-  run_privileged install -m 0644 "${SERVICE_TMP}" "${SERVICE_PATH}"
-  if command -v systemctl >/dev/null 2>&1; then
-    log "reloading systemd"
-    run_privileged systemctl daemon-reload
+if [[ "${INSTALL_SERVICE}" == "true" ]]; then
+  install_dir "$(dirname "${SERVICE_PATH}")"
+
+  if [[ "${SERVICE_MANAGER}" == "systemd" ]]; then
+    {
+      echo "[Unit]"
+      echo "Description=MyCodex Telegram multi-repo gateway"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo
+      echo "[Service]"
+      echo "Type=simple"
+      printf 'User=%s\n' "${RUN_USER}"
+      printf 'Group=%s\n' "${RUN_GROUP}"
+      printf 'WorkingDirectory=%s\n' "${STATE_DIR}"
+      echo "Environment=RUST_LOG=info"
+      printf 'EnvironmentFile=-%s\n' "${ENV_PATH}"
+      printf 'ExecStart=%s serve --config %s\n' "${INSTALL_BIN}" "${CONFIG_PATH}"
+      echo "Restart=always"
+      echo "RestartSec=3"
+      echo "NoNewPrivileges=true"
+      echo "PrivateTmp=true"
+      echo
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } > "${SERVICE_TMP}"
+
+    log "installing systemd service file to ${SERVICE_PATH}"
+    install_file 0644 "${SERVICE_TMP}" "${SERVICE_PATH}"
+    if command -v systemctl >/dev/null 2>&1; then
+      log "reloading systemd"
+      run_privileged systemctl daemon-reload
+    fi
+  else
+    printf -v install_bin_escaped '%q' "${INSTALL_BIN}"
+    printf -v config_path_escaped '%q' "${CONFIG_PATH}"
+    printf -v env_path_escaped '%q' "${ENV_PATH}"
+
+    {
+      echo "#!/usr/bin/env bash"
+      echo "set -euo pipefail"
+      echo 'export RUST_LOG="${RUST_LOG:-info}"'
+      printf 'if [[ -f %s ]]; then\n' "${env_path_escaped}"
+      echo "  set -a"
+      echo "  # shellcheck disable=SC1090"
+      printf '  . %s\n' "${env_path_escaped}"
+      echo "  set +a"
+      echo "fi"
+      printf 'exec %s serve --config %s\n' "${install_bin_escaped}" "${config_path_escaped}"
+    } > "${LAUNCH_SCRIPT_TMP}"
+
+    install_dir "$(dirname "${LAUNCH_SCRIPT_PATH}")"
+    log "installing launch script to ${LAUNCH_SCRIPT_PATH}"
+    install_file 0755 "${LAUNCH_SCRIPT_TMP}" "${LAUNCH_SCRIPT_PATH}"
+
+    {
+      cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "${SERVICE_LABEL}")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "${LAUNCH_SCRIPT_PATH}")</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "${STATE_DIR}")</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "${STATE_DIR}/mycodex.stdout.log")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "${STATE_DIR}/mycodex.stderr.log")</string>
+</dict>
+</plist>
+EOF
+    } > "${SERVICE_TMP}"
+
+    log "installing launchd agent plist to ${SERVICE_PATH}"
+    install_file 0644 "${SERVICE_TMP}" "${SERVICE_PATH}"
   fi
 fi
 
-SERVICE_NAME="$(basename "${SERVICE_PATH}")"
-if [[ "${UPDATE_MODE}" == "true" && "${INSTALL_SYSTEMD}" == "true" && -f "${SERVICE_PATH}" ]]; then
-  if command -v systemctl >/dev/null 2>&1; then
-    if run_privileged systemctl is-active --quiet "${SERVICE_NAME}"; then
-      log "restarting active service ${SERVICE_NAME}"
-      run_privileged systemctl restart "${SERVICE_NAME}"
+if [[ "${UPDATE_MODE}" == "true" && "${INSTALL_SERVICE}" == "true" && -f "${SERVICE_PATH}" ]]; then
+  if [[ "${SERVICE_MANAGER}" == "systemd" ]]; then
+    SERVICE_NAME="$(basename "${SERVICE_PATH}")"
+    if command -v systemctl >/dev/null 2>&1; then
+      if run_privileged systemctl is-active --quiet "${SERVICE_NAME}"; then
+        log "restarting active service ${SERVICE_NAME}"
+        run_privileged systemctl restart "${SERVICE_NAME}"
+      else
+        log "service ${SERVICE_NAME} is installed but not active; leaving it stopped"
+      fi
+    fi
+  else
+    if launchd_agent_loaded; then
+      log "reloading active launchd agent ${SERVICE_LABEL}"
+      reload_launchd_agent
     else
-      log "service ${SERVICE_NAME} is installed but not active; leaving it stopped"
+      log "launchd agent ${SERVICE_LABEL} is installed but not loaded; leaving it stopped"
     fi
   fi
 fi
@@ -403,9 +619,17 @@ Installed:
   env file:         ${ENV_PATH}
   workspace root:   ${WORKSPACE_ROOT}
   state dir:        ${STATE_DIR}
-  systemd service:  ${INSTALL_SYSTEMD}
+  service manager:  ${SERVICE_MANAGER}
+  service file:     $( [[ "${INSTALL_SERVICE}" == "true" ]] && printf '%s' "${SERVICE_PATH}" || printf 'not installed' )
   asset url:        ${ASSET_URL}
+EOF
+
+if [[ "${SERVICE_MANAGER}" == "launchd" && "${INSTALL_SERVICE}" == "true" ]]; then
+  printf '  launch script:    %s\n' "${LAUNCH_SCRIPT_PATH}"
+fi
+
+cat <<EOF
 
 Next step:
-  mycodex onboard --config ${CONFIG_PATH} --env-path ${ENV_PATH} --service-path ${SERVICE_PATH}
+  ${INSTALL_BIN} onboard --config ${CONFIG_PATH} --env-path ${ENV_PATH} --service-path ${SERVICE_PATH}
 EOF

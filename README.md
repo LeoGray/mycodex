@@ -2,681 +2,138 @@
 
 **Language:** English | [简体中文](./README.zh-CN.md)
 
-`MyCodex` is a Telegram-driven remote coding gateway for Linux servers.
+MyCodex is a Telegram-driven remote coding gateway for `codex`.
+It lets you run Codex against multiple Git repositories inside one workspace, with isolated repo state and multiple threads per repo.
 
-It manages multiple Git repositories inside one workspace and uses the locally installed `codex` CLI to provide isolated Codex runtimes and multiple conversation threads per repository.
+Core points:
 
-## Goals
+- Telegram is the control plane
+- One workspace can hold many first-level repos
+- Each repo has its own Codex runtime boundary
+- Each repo can have multiple threads
+- Command and patch approvals are handled from Telegram
 
-- Run on Linux servers.
-- Control Codex remotely through Telegram direct messages.
-- Support multiple first-level repositories inside one workspace.
-- Keep each repository isolated at the Codex runtime boundary.
-- Allow multiple Codex threads per repository.
-- Let the user switch repositories, switch threads, clone repositories, create new threads, and approve commands or patches from Telegram.
+## Quick Start
 
-## Core Model
+Prepare these first:
 
-Internally, the system is built around three layers:
+- a working `codex` CLI
+- Codex auth or `OPENAI_API_KEY`
+- `git`
+- a Telegram bot token
 
-- `workspace`
-  - A container directory for repositories, such as `/srv/workspace`
-  - Only first-level child directories are scanned
-- `repo`
-  - The real working unit
-  - Each repo has its own Codex runtime boundary
-  - Switching repos does not reuse another repo's runtime
-- `thread`
-  - A Codex conversation inside a repo
-  - One repo can have multiple threads
-  - One repo has exactly one active thread at a time
-
-This means:
-
-- Repo A and repo B do not share the same Codex process context
-- Repo A can keep multiple historical threads
-- When you switch back to repo A, you resume repo A's active thread instead of inheriting repo B's context
-
-## What Is Implemented
-
-Current MVP capabilities:
-
-- Telegram long polling
-- Single-user allowlist
-- Workspace first-level repository scan
-- Clone new repositories into the workspace
-- `/repo use` to switch the active repo
-- `/thread new` and `/thread use` inside each repo
-- Plain text messages routed to the active thread of the active repo
-- Codex command approvals
-- Codex file change approvals
-- Local state persistence
-
-## Current Limits
-
-This is still an MVP. Current constraints:
-
-- Telegram only
-- Single user only
-- Only scans first-level directories under the workspace
-- No nested repo, submodule, or git worktree support
-- `clone` only uses the default branch
-- Does not manage Codex login flows
-- No web UI
-- No multi-user isolation
-
-## Prerequisites
-
-Before deployment, prepare:
-
-1. A Linux server
-2. A working `codex` CLI installation
-3. Valid Codex authentication on that machine
-4. A Telegram bot token
-5. A working `git` setup on the server
-6. A workspace directory that will contain multiple repos
-
-Recommended sanity checks:
+Official one-line install for x86_64 Linux:
 
 ```bash
-codex --version
-codex app-server --help
-git --version
+curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
+/usr/local/bin/mycodex onboard
 ```
 
-## Codex Authentication
-
-`MyCodex` does not manage Codex login. It only uses whatever authentication is already available on the server.
-
-The recommended option is an environment variable:
+Source install for Linux or macOS:
 
 ```bash
-export OPENAI_API_KEY=...
+git clone https://github.com/LeoGray/mycodex.git
+cd mycodex
+./scripts/install.sh --install-service
+/usr/local/bin/mycodex onboard
 ```
 
-If your server already has a working `codex` login state, that can be reused as well. The `check` command validates:
+`onboard` will:
 
-- Telegram token availability
-- `codex app-server` initialization
-- Workspace existence
-- Repository scanning inside the workspace
+- validate the Telegram bot token
+- let you choose a workspace path
+- optionally store `OPENAI_API_KEY`
+- optionally enable the installed service
 
-## Configuration
+## Command Menu
 
-Start from the example:
+Basic:
 
-[config/config.example.toml](./config/config.example.toml)
+- `/start`
+- `/status`
+- `/abort`
 
-Example:
+Repo:
 
-```toml
-[workspace]
-root = "/srv/workspace"
+- `/repo list`
+- `/repo use <name>`
+- `/repo clone <git_url> [dir_name]`
+- `/repo status`
+- `/repo rescan`
 
-[telegram]
-bot_token = "123456:replace-me"
-access_mode = "pairing"
-poll_timeout_seconds = 30
+Thread:
 
-[codex]
-bin = "codex"
-# model = "gpt-5.1-codex"
-network_access = true
+- `/thread list`
+- `/thread new`
+- `/thread use <thread>`
+- `/thread status`
 
-[state]
-dir = "/var/lib/mycodex"
+Plain text messages are always sent to the active thread of the active repo.
 
-[ui]
-stream_edit_interval_ms = 1200
-max_inline_diff_chars = 6000
+## How It Works
 
-[git]
-clone_timeout_sec = 600
-allow_ssh = true
-allow_https = true
-```
+- `workspace`: a directory that contains first-level repos
+- `repo`: the runtime isolation boundary
+- `thread`: a Codex conversation inside one repo
 
-### Important Settings
+Switching repos does not reuse another repo's runtime context.
+
+Default access mode is `pairing`.
+First-time flow:
+
+1. Install MyCodex
+2. Run `/usr/local/bin/mycodex onboard`
+3. Send a message to the bot
+4. Get a pairing code
+5. Approve it on the server with `/usr/local/bin/mycodex pairing approve <CODE>`
+
+## Config
+
+Start from [config/config.example.toml](./config/config.example.toml).
+
+Most important keys:
 
 - `workspace.root`
-  - Repository container directory
-  - Example: `/srv/workspace`
 - `telegram.bot_token`
-  - Telegram bot token
 - `telegram.access_mode`
-  - Default recommended value is `pairing`
-  - In pairing mode, unknown users receive a pairing code instead of controlling the bot directly
 - `codex.bin`
-  - Path or command name for the `codex` executable
-- `codex.model`
-  - Optional explicit model override for turns
-- `codex.network_access`
-  - Whether Codex turn sandboxes can access the network
-  - Default is `true`
 - `state.dir`
-  - MyCodex state directory
-  - Stores repo/thread mappings, active repo/thread, temporary patch files, and related state
-- `ui.stream_edit_interval_ms`
-  - Telegram streaming edit throttle interval
-- `ui.max_inline_diff_chars`
-  - Diffs above this size are sent as `.patch` files instead of inline text
-- `git.clone_timeout_sec`
-  - Timeout for `git clone`
-- `git.allow_ssh`
-  - Whether SSH URLs are allowed
-- `git.allow_https`
-  - Whether HTTPS URLs are allowed
 
-## Local Run
+Default paths:
 
-For local development:
+- Linux
+  - config: `/etc/mycodex/config.toml`
+  - env: `/etc/mycodex/mycodex.env`
+  - service: `/etc/systemd/system/mycodex.service`
+  - state: `/var/lib/mycodex`
+- macOS
+  - config: `$HOME/.config/mycodex/config.toml`
+  - env: `$HOME/.config/mycodex/mycodex.env`
+  - service: `$HOME/Library/LaunchAgents/com.leogray.mycodex.plist`
+  - state: `$HOME/.local/state/mycodex`
 
-```bash
-cargo build --release
-./target/release/mycodex check --config ./config/config.example.toml
-./target/release/mycodex serve --config ./config/config.example.toml
-```
+## Install And Release Notes
 
-`check` performs startup validation. `serve` starts the Telegram polling loop and Codex event loop.
-
-## Install Entry Points
-
-There are two separate installers in this repository:
-
-- [scripts/install.sh](./scripts/install.sh)
-  - For users who already cloned the repository
-  - Builds from the local source tree and installs MyCodex
-- [public/install.sh](./public/install.sh)
-  - For a website-hosted one-line installer
-  - Downloads a prebuilt release binary and installs MyCodex
-
-These two entry points are intentionally separate.
-
-## Scenario 1: Install From Source
-
-Use this when:
-
-- You already cloned the repository
-- You want to build from the current source tree
-- You are developing, testing, or doing a manual deployment
-
-Example:
-
-```bash
-./scripts/install.sh \
-  --install-systemd
-```
-
-This mode will:
-
-- Run `cargo build --release` from the current source tree
-- Install the release binary
-- Generate config and environment templates
-- Optionally install the systemd unit
-- Print the next onboarding command
-
-If an existing installation is detected, the script automatically switches to update mode:
-
-- It keeps the existing config and env files
-- It reuses the current systemd choice
-- It restarts the service automatically if that service is already active
-
-## Scenario 2: Install From a Prebuilt Release
-
-Use this when:
-
-- Users do not want to clone the repository
-- You want a single install command
-- You publish release binaries to GitHub Releases or another download URL
-
-Recommended one-line install:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
-```
-
-This installs the binary, prepares config/state directories, optionally installs systemd, and then hands off to onboarding.
-
-Advanced example:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --install-systemd
-```
-
-You can also provide a full asset URL:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash -s -- \
-  --asset-url https://example.com/mycodex-x86_64-unknown-linux-gnu.tar.gz
-```
-
-This mode will:
-
-- Infer the Linux target triple from the current machine
-- Download the matching release archive
-- Extract the `mycodex` binary
-- Continue with the same install-only flow used by the source installer
-
-If an existing installation is detected, the public installer automatically switches to update mode:
-
-- It keeps the current install layout
-- It does not ask again whether systemd should be installed
-- It restarts the service automatically if it is already active
-
-### OpenClaw-Style One-Liner
-
-For this open-source setup, you can use GitHub Raw directly:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
-```
-
-The public installer already defaults to `LeoGray/mycodex`. If you fork or rebrand the project, update the default GitHub repo near the top of `public/install.sh`.
-
-### Default Installer Behavior
-
-Both installers default to:
-
-- Running the service as the current user instead of forcing a dedicated system user
-- Reusing the current user's existing:
-  - Codex auth state
-  - Git credentials
-  - SSH keys
-- Using these default paths:
-  - Binary: `/usr/local/bin/mycodex`
-  - Config: `/etc/mycodex/config.toml`
-  - Environment file: `/etc/mycodex/mycodex.env`
-  - Service: `/etc/systemd/system/mycodex.service`
-  - Workspace: `/srv/workspace`
-  - State dir: `/var/lib/mycodex`
-
-### Common Parameters For `scripts/install.sh`
-
-The source installer supports:
-
- - `--update`
-- `--run-user`
-- `--run-group`
-- `--workspace-root`
-- `--state-dir`
-- `--install-bin`
-- `--config-path`
-- `--env-path`
-- `--service-path`
-- `--install-systemd`
-- `--skip-systemd`
-- `--skip-build`
-
-### Common Parameters For `public/install.sh`
-
-The public installer supports:
-
- - `--update`
-- `--github-repo`
-- `--release-version`
-- `--asset-url`
-- `--target-triple`
-- `--run-user`
-- `--run-group`
-- `--workspace-root`
-- `--state-dir`
-- `--install-bin`
-- `--config-path`
-- `--env-path`
-- `--service-path`
-- `--install-systemd`
-- `--skip-systemd`
-
-### Environment Variable Fallbacks
-
-Supported installer environment variables:
-
-- `MYCODEX_TELEGRAM_BOT_TOKEN`
-- `MYCODEX_RELEASE_GITHUB_REPO`
-- `MYCODEX_RELEASE_VERSION`
-- `MYCODEX_RELEASE_ASSET_URL`
-- `MYCODEX_RELEASE_TARGET_TRIPLE`
-- `OPENAI_API_KEY`
-
-## Release Packaging
-
-To support prebuilt release installs, the repo also includes:
-
-[scripts/package-release.sh](./scripts/package-release.sh)
+- [public/install.sh](./public/install.sh) is the official prebuilt installer and defaults to `x86_64-unknown-linux-musl`
+- [scripts/install.sh](./scripts/install.sh) builds from local source and supports Linux and macOS
+- If you build your own archive, you can still use `public/install.sh --asset-url <URL>`
+- Manual packaging uses [scripts/package-release.sh](./scripts/package-release.sh)
 
 Examples:
 
 ```bash
-./scripts/package-release.sh --target x86_64-unknown-linux-gnu
-./scripts/package-release.sh --target aarch64-unknown-linux-musl
+./scripts/package-release.sh --target x86_64-unknown-linux-musl
+./scripts/package-release.sh --target aarch64-apple-darwin
 ```
 
-This generates archives such as:
+CI runs on Linux and macOS.
+The official release workflow publishes one Linux artifact: `mycodex-x86_64-unknown-linux-musl.tar.gz`.
 
-- `dist/mycodex-x86_64-unknown-linux-gnu.tar.gz`
-- `dist/mycodex-aarch64-unknown-linux-musl.tar.gz`
-
-The release installer resolves assets using this naming convention by default.
-
-## GitHub Actions Build And Release
-
-The repository now includes two GitHub Actions workflows:
-
-- [ci.yml](./.github/workflows/ci.yml)
-  - Runs `cargo check` and `cargo test` on GitHub-hosted `ubuntu-latest`
-- [release.yml](./.github/workflows/release.yml)
-  - Builds Linux release artifacts when you push a tag
-  - Currently produces:
-    - `mycodex-x86_64-unknown-linux-gnu.tar.gz`
-    - `mycodex-x86_64-unknown-linux-musl.tar.gz`
-  - Uploads them to GitHub Releases
-
-This is the missing piece that makes the public installer practical.
-
-## Onboarding
-
-After installation, run:
+## Development
 
 ```bash
-mycodex onboard
+cargo build --release
+cargo test
 ```
 
-The onboarding flow is interactive and currently handles:
-
-- Telegram bot token validation via `getMe`
-- Workspace root selection
-  - default: `$HOME/workspace`
-  - custom path allowed
-  - create-if-missing flow
-- Optional `OPENAI_API_KEY`
-- Optional start of an installed systemd service
-
-The intended product flow is now:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/LeoGray/mycodex/main/public/install.sh | bash
-mycodex onboard
-```
-
-## Pairing
-
-MyCodex now defaults to `telegram.access_mode = "pairing"`.
-
-That means:
-
-- Unknown Telegram users do not control the bot directly
-- They receive a pairing code
-- An operator approves the code on the server
-
-Server-side commands:
-
-```bash
-mycodex pairing list
-mycodex pairing approve <CODE>
-mycodex pairing reject <CODE>
-```
-
-Typical first-time flow:
-
-1. Install MyCodex
-2. Run `mycodex onboard`
-3. Send a message to the bot from Telegram
-4. Receive a pairing code
-5. Approve it on the server with `mycodex pairing approve <CODE>`
-
-## systemd Deployment
-
-Use this template as a starting point:
-
-[deploy/systemd/mycodex.service](./deploy/systemd/mycodex.service)
-
-Suggested directory layout:
-
-- `/usr/local/bin/mycodex`
-- `/etc/mycodex/config.toml`
-- `/etc/mycodex/mycodex.env`
-- `/var/lib/mycodex`
-- `/srv/workspace`
-
-### 1. Copy Binary And Config
-
-```bash
-sudo mkdir -p /etc/mycodex
-sudo mkdir -p /var/lib/mycodex
-sudo mkdir -p /srv/workspace
-sudo cp ./target/release/mycodex /usr/local/bin/mycodex
-sudo cp ./config/config.example.toml /etc/mycodex/config.toml
-```
-
-### 2. Write Environment File
-
-Example:
-
-```bash
-sudo tee /etc/mycodex/mycodex.env >/dev/null <<'EOF'
-OPENAI_API_KEY=replace-me
-EOF
-```
-
-### 3. Install systemd Service
-
-```bash
-sudo cp ./deploy/systemd/mycodex.service /etc/systemd/system/mycodex.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now mycodex
-```
-
-### 4. View Logs
-
-```bash
-sudo journalctl -u mycodex -f
-```
-
-## Telegram Commands
-
-### Basic Commands
-
-- `/start`
-  - Show help
-- `/status`
-  - Show the active repo, active thread, runtime status, active turn, and pending approval
-- `/abort`
-  - Interrupt the active turn
-
-### Repo Commands
-
-- `/repo list`
-  - List registered repos
-- `/repo use <name>`
-  - Switch the active repo
-- `/repo clone <git_url> [dir_name]`
-  - Clone a new repo into the workspace
-- `/repo status`
-  - Show the current repo state
-- `/repo rescan`
-  - Rescan existing repos under the workspace
-
-### Thread Commands
-
-- `/thread list`
-  - List threads inside the current repo
-- `/thread new`
-  - Create a new thread in the current repo
-- `/thread use <thread>`
-  - Switch to an older thread in the current repo
-  - `<thread>` can be a list index or a local thread ID prefix
-- `/thread status`
-  - Show the active thread in the current repo
-
-### Plain Text Messages
-
-Plain text is always routed to:
-
-- The current active repo
-- The current active thread
-
-If the current repo does not yet have a thread, the first plain text message creates one automatically.
-
-## Typical Flow
-
-### Scenario 1: First Time In Repo A
-
-```text
-/repo rescan
-/repo use repo-a
-Fix the CI failure in this repository
-```
-
-What happens:
-
-- MyCodex starts the Codex runtime for repo A
-- If repo A has no thread yet, one is created automatically
-- Further text messages go to repo A's active thread
-
-### Scenario 2: Repo A Context Is Too Long
-
-```text
-/thread new
-Let's rethink the implementation from scratch
-```
-
-What happens:
-
-- You stay inside repo A
-- No second repo runtime is started
-- A new Codex thread is created under repo A
-
-### Scenario 3: Switch To Repo B
-
-```text
-/repo use repo-b
-Review the deployment scripts in this repository
-```
-
-What happens:
-
-- Repo A's runtime is stopped
-- Repo B's runtime is started
-- Repo B uses its own thread set
-- Repo A context is not reused
-
-## Approval Behavior
-
-When Codex wants to run a higher-risk command or apply file changes, MyCodex sends an approval message in Telegram.
-
-### Command Approval
-
-The message includes:
-
-- Repo name
-- Thread title
-- CWD
-- Command
-- Reason
-
-Buttons:
-
-- `Approve once`
-- `Decline`
-- `Abort turn`
-
-### File Approval
-
-The message includes:
-
-- Repo name
-- Thread title
-- Changed paths
-- Diff preview
-
-If the diff is too large, a `.patch` file is sent as well.
-
-Buttons:
-
-- `Approve patch`
-- `Decline patch`
-
-## State Persistence
-
-MyCodex stores the following under `state.dir`:
-
-- Repo catalog
-- Thread catalog for each repo
-- Current active repo
-- Current active thread
-- Current pending approval
-- Current progress message ID
-
-After a service restart:
-
-- Repo and thread mappings are preserved
-- The active repo is restored when possible
-- Stale active turns are not restored
-- Stale pending approvals are not restored
-
-## Workspace Scan Rules
-
-On startup and during `/repo rescan`, MyCodex only scans first-level directories under `workspace.root`.
-
-Example:
-
-```text
-/srv/workspace
-├── repo-a
-├── repo-b
-└── repo-c
-```
-
-Only directories like `repo-a`, `repo-b`, and `repo-c` are recognized.
-
-## Clone Rules
-
-Current clone behavior:
-
-- Supports `https://...`
-- Supports `ssh://...`
-- Supports scp-style SSH URLs such as `git@host:org/repo.git`
-- Uses the default branch
-- Uses the repo basename as the default target directory
-- Rejects the operation if the target directory already exists
-- Relies on the server's existing SSH keys or credential helper for Git auth
-
-## Troubleshooting
-
-### `mycodex check` Fails
-
-Check:
-
-- Whether the Telegram token is correct
-- Whether `codex` is on `PATH`
-- Whether `codex app-server` can start
-- Whether `OPENAI_API_KEY` or existing login state is valid
-- Whether the workspace and state directories exist and are writable
-
-### Telegram Does Not Respond
-
-Check:
-
-- Whether the bot token is correct
-- Whether the service was onboarded successfully
-- Whether pairing requests exist via `mycodex pairing list`
-- Whether the logs show `telegram polling failed`
-
-### Clone Fails
-
-Check:
-
-- Whether the server can access the remote Git host
-- Whether SSH keys or credentials are valid
-- Whether the target directory already exists
-- Whether the URL is blocked by `git.allow_ssh` or `git.allow_https`
-
-### Codex Runtime Problems
-
-Check:
-
-- `codex --version`
-- `codex app-server --help`
-- `OPENAI_API_KEY`
-- `journalctl -u mycodex -f`
+For manual Linux service setup, use [deploy/systemd/mycodex.service](./deploy/systemd/mycodex.service) as a starting point.

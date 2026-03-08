@@ -10,6 +10,7 @@ use crate::config::{
     CodexConfig, Config, GitConfig, StateConfig, TelegramAccessMode, TelegramConfig, UiConfig,
     WorkspaceConfig,
 };
+use crate::platform;
 use crate::telegram::api::{TelegramClient, default_bot_commands};
 
 pub struct OnboardOptions {
@@ -104,24 +105,27 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
     if options.service_path.exists()
         && confirm(
             &format!(
-                "A systemd unit exists at {}. Enable and start it now?",
-                options.service_path.display()
+                "A {} exists at {}. Enable and start it now?",
+                platform::service_definition_name(),
+                options.service_path.display(),
             ),
             true,
         )?
     {
-        let service_name = options
-            .service_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("service path must have a valid file name")?;
-        match run_systemctl_enable_now(service_name) {
-            Ok(()) => {
-                println!("systemd service started: {service_name}");
+        match platform::enable_and_start_service(&options.service_path) {
+            Ok(service_name) => {
+                println!(
+                    "{} started: {}",
+                    platform::service_definition_name(),
+                    service_name
+                );
             }
             Err(err) => {
                 eprintln!("Failed to start service automatically: {err}");
-                eprintln!("Run manually: sudo systemctl enable --now {service_name}");
+                eprintln!(
+                    "Run manually: {}",
+                    platform::manual_start_hint(&options.service_path)?
+                );
             }
         }
     }
@@ -225,36 +229,6 @@ fn run_self_check(config_path: &Path, env_map: &HashMap<String, String>) -> Resu
         bail!("`mycodex check` failed; update the configuration and retry onboarding");
     }
     Ok(())
-}
-
-fn run_systemctl_enable_now(service_name: &str) -> Result<()> {
-    let mut command = if nix_like_root() {
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("enable").arg("--now").arg(service_name);
-        cmd
-    } else {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("systemctl")
-            .arg("enable")
-            .arg("--now")
-            .arg(service_name);
-        cmd
-    };
-    let status = command.status().context("failed to run systemctl")?;
-    if !status.success() {
-        bail!("systemctl exited with status {status}");
-    }
-    Ok(())
-}
-
-fn nix_like_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim() == "0")
-        .unwrap_or(false)
 }
 
 fn prompt_required(label: &str, default: Option<&str>, secret: bool) -> Result<String> {
