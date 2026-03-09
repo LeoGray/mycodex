@@ -6,6 +6,12 @@ bot_token = "123456:replace-me"
 access_mode = "pairing"
 poll_timeout_seconds = 30
 
+[app]
+enabled = false
+bind_addr = "127.0.0.1:3940"
+public_base_url = ""
+pairing_code_ttl_sec = 600
+
 [codex]
 bin = "codex"
 # model = "gpt-5.1-codex"

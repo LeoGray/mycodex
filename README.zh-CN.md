@@ -45,6 +45,14 @@ cd mycodex
 - 可选写入 `OPENAI_API_KEY`
 - 可选启用已安装的服务
 
+## 仓库结构
+
+- `apps/server`：Rust daemon、Telegram 适配层、APP gateway 和 CLI
+- `apps/desktop`：Tauri + React 桌面客户端骨架
+- `config`：示例配置
+- `deploy`：服务定义
+- `scripts`：安装和打包脚本
+
 ## 命令菜单
 
 基础命令：
@@ -134,6 +142,14 @@ CI 会在 Linux 和 macOS 上跑。
 ```bash
 cargo build --release
 cargo test
+```
+
+桌面端：
+
+```bash
+cd apps/desktop
+npm install
+npm run tauri:dev
 ```
 
 如果你要手动部署 Linux 服务，可以把 [deploy/systemd/mycodex.service](./deploy/systemd/mycodex.service) 当成起点。

@@ -40,16 +40,43 @@ pub struct RepoRecord {
 impl RepoRecord {
     pub fn active_thread(&self) -> Option<&ThreadRecord> {
         let active_thread = self.active_thread_local_id.as_ref()?;
-        self.threads
-            .iter()
-            .find(|thread| &thread.local_thread_id == active_thread)
+        self.threads.iter().find(|thread| {
+            thread.surface == ThreadSurface::Telegram && &thread.local_thread_id == active_thread
+        })
     }
 
     pub fn active_thread_mut(&mut self) -> Option<&mut ThreadRecord> {
         let active_thread = self.active_thread_local_id.clone()?;
+        self.threads.iter_mut().find(|thread| {
+            thread.surface == ThreadSurface::Telegram && thread.local_thread_id == active_thread
+        })
+    }
+
+    pub fn threads_for_surface(&self, surface: ThreadSurface) -> Vec<&ThreadRecord> {
+        self.threads
+            .iter()
+            .filter(|thread| thread.surface == surface)
+            .collect()
+    }
+
+    pub fn find_thread(
+        &self,
+        local_thread_id: &str,
+        surface: ThreadSurface,
+    ) -> Option<&ThreadRecord> {
+        self.threads
+            .iter()
+            .find(|thread| thread.surface == surface && thread.local_thread_id == local_thread_id)
+    }
+
+    pub fn find_thread_mut(
+        &mut self,
+        local_thread_id: &str,
+        surface: ThreadSurface,
+    ) -> Option<&mut ThreadRecord> {
         self.threads
             .iter_mut()
-            .find(|thread| thread.local_thread_id == active_thread)
+            .find(|thread| thread.surface == surface && thread.local_thread_id == local_thread_id)
     }
 }
 
@@ -61,11 +88,20 @@ pub struct ThreadRecord {
     pub codex_thread_path: Option<PathBuf>,
     pub repo_id: String,
     pub title: String,
+    #[serde(default = "default_thread_surface")]
+    pub surface: ThreadSurface,
     pub status: ThreadStatusRecord,
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
     #[serde(default)]
     pub has_user_message: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSurface {
+    Telegram,
+    App,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +297,27 @@ impl AppState {
         self.active_repo_mut()?.active_thread_mut()
     }
 
+    pub fn threads_for_surface(
+        &self,
+        repo_id: &str,
+        surface: ThreadSurface,
+    ) -> Result<Vec<&ThreadRecord>> {
+        let repo = self
+            .find_repo_by_id(repo_id)
+            .with_context(|| format!("repo not found: {repo_id}"))?;
+        Ok(repo.threads_for_surface(surface))
+    }
+
+    pub fn find_thread_for_surface(
+        &self,
+        repo_id: &str,
+        local_thread_id: &str,
+        surface: ThreadSurface,
+    ) -> Option<&ThreadRecord> {
+        self.find_repo_by_id(repo_id)
+            .and_then(|repo| repo.find_thread(local_thread_id, surface))
+    }
+
     pub fn is_peer_approved(&self, user_id: i64, chat_id: i64) -> bool {
         self.approved_telegram_peers
             .iter()
@@ -343,28 +400,38 @@ impl AppState {
         repo: &'a RepoRecord,
         value: &str,
     ) -> Option<&'a ThreadRecord> {
+        self.resolve_thread_ref_for_surface(repo, value, ThreadSurface::Telegram)
+    }
+
+    pub fn resolve_thread_ref_for_surface<'a>(
+        &'a self,
+        repo: &'a RepoRecord,
+        value: &str,
+        surface: ThreadSurface,
+    ) -> Option<&'a ThreadRecord> {
+        let threads = repo.threads_for_surface(surface);
         if let Ok(index) = value.parse::<usize>() {
             if index > 0 {
-                if let Some(thread) = repo.threads.get(index - 1) {
+                if let Some(thread) = threads.get(index - 1) {
                     return Some(thread);
                 }
             }
         }
-        if let Some(thread) = repo
-            .threads
+        if let Some(thread) = threads
             .iter()
+            .copied()
             .find(|thread| thread.local_thread_id.starts_with(value))
         {
             return Some(thread);
         }
-        if let Some(thread) = repo
-            .threads
+        if let Some(thread) = threads
             .iter()
+            .copied()
             .find(|thread| thread.codex_thread_id.starts_with(value))
         {
             return Some(thread);
         }
-        repo.threads.iter().find(|thread| thread.title == value)
+        threads.into_iter().find(|thread| thread.title == value)
     }
 
     pub fn create_thread_for_repo(
@@ -374,6 +441,7 @@ impl AppState {
         codex_thread_path: Option<PathBuf>,
         title: String,
         has_user_message: bool,
+        surface: ThreadSurface,
     ) -> Result<ThreadRecord> {
         let now = Utc::now();
         let local_thread_id = Uuid::new_v4().to_string();
@@ -383,6 +451,7 @@ impl AppState {
             codex_thread_path,
             repo_id: repo_id.to_string(),
             title,
+            surface,
             status: ThreadStatusRecord::Active,
             created_at: now,
             last_used_at: now,
@@ -394,12 +463,14 @@ impl AppState {
             .with_context(|| format!("repo not found: {repo_id}"))?;
 
         for item in &mut repo.threads {
-            if item.status == ThreadStatusRecord::Active {
+            if item.surface == surface && item.status == ThreadStatusRecord::Active {
                 item.status = ThreadStatusRecord::Historical;
             }
         }
 
-        repo.active_thread_local_id = Some(local_thread_id);
+        if surface == ThreadSurface::Telegram {
+            repo.active_thread_local_id = Some(local_thread_id);
+        }
         repo.last_used_at = now;
         repo.threads.push(thread.clone());
         Ok(thread)
@@ -409,6 +480,7 @@ impl AppState {
         &mut self,
         repo_id: &str,
         local_thread_id: &str,
+        surface: ThreadSurface,
         codex_thread_id: String,
         codex_thread_path: Option<PathBuf>,
     ) -> Result<()> {
@@ -416,9 +488,7 @@ impl AppState {
             .find_repo_by_id_mut(repo_id)
             .with_context(|| format!("repo not found: {repo_id}"))?;
         let thread = repo
-            .threads
-            .iter_mut()
-            .find(|thread| thread.local_thread_id == local_thread_id)
+            .find_thread_mut(local_thread_id, surface)
             .with_context(|| format!("thread not found: {local_thread_id}"))?;
         thread.codex_thread_id = codex_thread_id;
         if codex_thread_path.is_some() {
@@ -436,10 +506,9 @@ impl AppState {
             Some(active_thread_id) => active_thread_id,
             None => return Ok(None),
         };
-        let thread = repo
-            .threads
-            .iter_mut()
-            .find(|thread| thread.local_thread_id == active_thread_id);
+        let thread = repo.threads.iter_mut().find(|thread| {
+            thread.surface == ThreadSurface::Telegram && thread.local_thread_id == active_thread_id
+        });
         if let Some(thread) = thread {
             if thread.status == ThreadStatusRecord::Active {
                 thread.status = ThreadStatusRecord::Historical;
@@ -449,24 +518,31 @@ impl AppState {
         Ok(None)
     }
 
-    pub fn activate_thread(&mut self, repo_id: &str, local_thread_id: &str) -> Result<()> {
+    pub fn activate_thread(
+        &mut self,
+        repo_id: &str,
+        local_thread_id: &str,
+        surface: ThreadSurface,
+    ) -> Result<()> {
         let repo = self
             .find_repo_by_id_mut(repo_id)
             .with_context(|| format!("repo not found: {repo_id}"))?;
         let mut found = false;
         for thread in &mut repo.threads {
-            if thread.local_thread_id == local_thread_id {
+            if thread.surface == surface && thread.local_thread_id == local_thread_id {
                 thread.status = ThreadStatusRecord::Active;
                 thread.last_used_at = Utc::now();
                 found = true;
-            } else if thread.status == ThreadStatusRecord::Active {
+            } else if thread.surface == surface && thread.status == ThreadStatusRecord::Active {
                 thread.status = ThreadStatusRecord::Historical;
             }
         }
         if !found {
             anyhow::bail!("thread not found: {local_thread_id}");
         }
-        repo.active_thread_local_id = Some(local_thread_id.to_string());
+        if surface == ThreadSurface::Telegram {
+            repo.active_thread_local_id = Some(local_thread_id.to_string());
+        }
         repo.last_used_at = Utc::now();
         Ok(())
     }
@@ -477,6 +553,25 @@ impl AppState {
             thread.has_user_message = true;
             thread.last_used_at = Utc::now();
         }
+    }
+
+    pub fn update_thread_title(
+        &mut self,
+        repo_id: &str,
+        local_thread_id: &str,
+        surface: ThreadSurface,
+        title: String,
+    ) -> Result<()> {
+        let repo = self
+            .find_repo_by_id_mut(repo_id)
+            .with_context(|| format!("repo not found: {repo_id}"))?;
+        let thread = repo
+            .find_thread_mut(local_thread_id, surface)
+            .with_context(|| format!("thread not found: {local_thread_id}"))?;
+        thread.title = title;
+        thread.has_user_message = true;
+        thread.last_used_at = Utc::now();
+        Ok(())
     }
 
     pub fn approval_rules_for_repo(&self, repo_id: &str) -> Vec<&ApprovalRule> {
@@ -552,6 +647,10 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn default_thread_surface() -> ThreadSurface {
+    ThreadSurface::Telegram
+}
+
 fn generate_pairing_code() -> String {
     Uuid::new_v4()
         .simple()
@@ -588,6 +687,7 @@ mod tests {
                     codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "first".into(),
+                    surface: ThreadSurface::Telegram,
                     status: ThreadStatusRecord::Historical,
                     created_at: Utc::now(),
                     last_used_at: Utc::now(),
@@ -599,6 +699,7 @@ mod tests {
                     codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "second".into(),
+                    surface: ThreadSurface::Telegram,
                     status: ThreadStatusRecord::Active,
                     created_at: Utc::now(),
                     last_used_at: Utc::now(),
@@ -631,6 +732,7 @@ mod tests {
                 codex_thread_path: None,
                 repo_id: "repo-1".into(),
                 title: "hello".into(),
+                surface: ThreadSurface::Telegram,
                 status: ThreadStatusRecord::Active,
                 created_at: Utc::now(),
                 last_used_at: Utc::now(),
@@ -662,6 +764,7 @@ mod tests {
                     codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "first".into(),
+                    surface: ThreadSurface::Telegram,
                     status: ThreadStatusRecord::Historical,
                     created_at: Utc::now(),
                     last_used_at: Utc::now(),
@@ -673,6 +776,7 @@ mod tests {
                     codex_thread_path: None,
                     repo_id: "repo-1".into(),
                     title: "second".into(),
+                    surface: ThreadSurface::Telegram,
                     status: ThreadStatusRecord::Active,
                     created_at: Utc::now(),
                     last_used_at: Utc::now(),
@@ -733,6 +837,7 @@ mod tests {
                         codex_thread_path: None,
                         repo_id: "repo-1".into(),
                         title: "first".into(),
+                        surface: ThreadSurface::Telegram,
                         status: ThreadStatusRecord::Historical,
                         created_at: Utc::now(),
                         last_used_at: Utc::now(),
@@ -744,6 +849,7 @@ mod tests {
                         codex_thread_path: None,
                         repo_id: "repo-1".into(),
                         title: "second".into(),
+                        surface: ThreadSurface::Telegram,
                         status: ThreadStatusRecord::Active,
                         created_at: Utc::now(),
                         last_used_at: Utc::now(),

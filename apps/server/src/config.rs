@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub workspace: WorkspaceConfig,
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub app: AppConfig,
     pub codex: CodexConfig,
     pub state: StateConfig,
     pub ui: UiConfig,
@@ -44,6 +46,29 @@ pub struct CodexConfig {
     pub model: Option<String>,
     #[serde(default = "default_network_access")]
     pub network_access: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_app_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default)]
+    pub public_base_url: String,
+    #[serde(default = "default_app_pairing_code_ttl_sec")]
+    pub pairing_code_ttl_sec: u64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_app_bind_addr(),
+            public_base_url: String::new(),
+            pairing_code_ttl_sec: default_app_pairing_code_ttl_sec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +141,21 @@ impl Config {
         if self.codex.bin.trim().is_empty() {
             bail!("codex.bin must not be empty");
         }
+        if self.app.bind_addr.trim().is_empty() {
+            bail!("app.bind_addr must not be empty");
+        }
+        self.app
+            .bind_addr
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| {
+                format!(
+                    "app.bind_addr must be a valid socket address, got {}",
+                    self.app.bind_addr
+                )
+            })?;
+        if self.app.pairing_code_ttl_sec == 0 {
+            bail!("app.pairing_code_ttl_sec must be greater than 0");
+        }
         if self.ui.stream_edit_interval_ms == 0 {
             bail!("ui.stream_edit_interval_ms must be greater than 0");
         }
@@ -137,6 +177,10 @@ impl Config {
 
     pub fn temp_dir(&self) -> PathBuf {
         self.state.dir.join("tmp")
+    }
+
+    pub fn app_auth_file(&self) -> PathBuf {
+        self.state.dir.join("app_auth.json")
     }
 }
 
@@ -160,6 +204,14 @@ fn default_poll_timeout_seconds() -> u64 {
 
 fn default_network_access() -> bool {
     true
+}
+
+fn default_app_bind_addr() -> String {
+    "127.0.0.1:3940".to_string()
+}
+
+fn default_app_pairing_code_ttl_sec() -> u64 {
+    600
 }
 
 fn default_stream_edit_interval_ms() -> u64 {

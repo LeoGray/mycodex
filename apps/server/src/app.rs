@@ -5,10 +5,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
+use crate::app_auth::AppAuthStore;
+use crate::app_gateway::{
+    AppApprovalDecision, AppControlCommand, AppControlError, AppGatewayHandle,
+};
 use crate::codex::protocol::{
     CommandExecutionApprovalDecision, FileChangeApprovalDecision, FileUpdateChange, RpcId,
     ThreadItem, TurnStatus,
@@ -19,7 +24,7 @@ use crate::commands::{
 };
 use crate::config::{Config, TelegramAccessMode};
 use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
-use crate::state::{AppState, PendingRequest, StateStore, ThreadRecord};
+use crate::state::{AppState, StateStore, ThreadRecord, ThreadSurface};
 use crate::telegram::api::{
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramMessage,
     Update, default_bot_commands,
@@ -37,24 +42,77 @@ pub struct App {
     telegram: TelegramClient,
     state_store: StateStore,
     state: AppState,
-    runtime: Option<CodexRuntime>,
+    runtimes: HashMap<String, CodexRuntime>,
     codex_events_tx: mpsc::Sender<CodexEvent>,
     codex_events_rx: mpsc::Receiver<CodexEvent>,
+    app_control_rx: mpsc::Receiver<AppControlCommand>,
+    app_gateway: Option<AppGatewayHandle>,
     update_offset: i64,
-    progress: Option<ActiveProgress>,
-    active_file_changes: HashMap<String, Vec<FileUpdateChange>>,
+    active_runs: HashMap<String, ActiveRun>,
+    active_file_changes: HashMap<String, HashMap<String, Vec<FileUpdateChange>>>,
 }
 
 #[derive(Debug, Clone)]
-struct ActiveProgress {
-    chat_id: i64,
-    repo_id: String,
+struct ActiveRun {
+    surface: ThreadSurface,
     thread_local_id: String,
-    message_id: i64,
+    turn_id: String,
     assistant_text: String,
     command_output_tail: String,
     diff_preview: String,
-    last_rendered_at: Option<Instant>,
+    route: RunRoute,
+    pending_request: Option<RuntimePendingRequest>,
+}
+
+#[derive(Debug, Clone)]
+enum RunRoute {
+    Telegram {
+        chat_id: i64,
+        message_id: i64,
+        last_rendered_at: Option<Instant>,
+    },
+    App {
+        device_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum RuntimePendingRequest {
+    Command(CommandPendingRequest),
+    File(FilePendingRequest),
+}
+
+#[derive(Debug, Clone)]
+struct CommandPendingRequest {
+    request_id: RpcId,
+    thread_title: String,
+    turn_id: String,
+    item_id: String,
+    command: Option<String>,
+    cwd: Option<PathBuf>,
+    reason: Option<String>,
+    telegram_message: Option<TelegramApprovalMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct FilePendingRequest {
+    request_id: RpcId,
+    thread_title: String,
+    turn_id: String,
+    item_id: String,
+    paths: Vec<String>,
+    reason: Option<String>,
+    diff_preview: String,
+    patch_path: Option<PathBuf>,
+    preferred_decision: FileChangeApprovalDecision,
+    telegram_message: Option<TelegramApprovalMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramApprovalMessage {
+    chat_id: i64,
+    message_id: i64,
+    text: String,
 }
 
 impl App {
@@ -67,6 +125,7 @@ impl App {
             .with_context(|| format!("failed to create {}", config.temp_dir().display()))?;
 
         let state_store = StateStore::new(config.state_file());
+        let auth_store = AppAuthStore::new(config.app_auth_file());
         let mut state = state_store.load()?;
         state.clear_stale_runtime_state();
         let discovered = discover_workspace_repos(&config.workspace.root)?;
@@ -78,22 +137,37 @@ impl App {
             warn!("failed to register Telegram bot commands: {err}");
         }
         let (codex_events_tx, codex_events_rx) = mpsc::channel(256);
+        let (app_control_tx, app_control_rx) = mpsc::channel(128);
+        let app_gateway = if config.app.enabled {
+            Some(AppGatewayHandle::spawn(
+                config.app.clone(),
+                auth_store.clone(),
+                app_control_tx,
+            )?)
+        } else {
+            None
+        };
 
         let mut app = Self {
             config,
             telegram,
             state_store,
             state,
-            runtime: None,
+            runtimes: HashMap::new(),
             codex_events_tx,
             codex_events_rx,
+            app_control_rx,
+            app_gateway,
             update_offset: 0,
-            progress: None,
+            active_runs: HashMap::new(),
             active_file_changes: HashMap::new(),
         };
 
         if let Some(active_repo_id) = app.state.active_repo_id.clone() {
-            if let Err(err) = app.ensure_runtime_for_repo(&active_repo_id).await {
+            if let Err(err) = app
+                .ensure_runtime_for_repo(&active_repo_id, None, ThreadSurface::Telegram)
+                .await
+            {
                 warn!(
                     "failed to restore active repo runtime {}: {err}",
                     active_repo_id
@@ -127,6 +201,7 @@ impl App {
 
     pub async fn run(&mut self) -> Result<()> {
         info!("starting MyCodex event loop");
+        let mut runtime_poll = interval(Duration::from_millis(800));
         loop {
             tokio::select! {
                 result = self.telegram.get_updates(self.update_offset, self.config.telegram.poll_timeout_seconds) => {
@@ -155,6 +230,15 @@ impl App {
                         None => break,
                     }
                 }
+                maybe_command = self.app_control_rx.recv() => {
+                    match maybe_command {
+                        Some(command) => self.handle_app_control_command(command).await,
+                        None => break,
+                    }
+                }
+                _ = runtime_poll.tick() => {
+                    self.reconcile_runtime_exits(None).await?;
+                }
             }
         }
 
@@ -173,7 +257,7 @@ impl App {
                     .as_ref()
                     .and_then(|callback| callback.message.as_ref().map(|message| message.chat.id))
             });
-        self.reconcile_runtime_exit(chat_id).await?;
+        self.reconcile_runtime_exits(chat_id).await?;
 
         if let Some(message) = update.message {
             self.handle_incoming_message(message).await?;
@@ -281,6 +365,8 @@ impl App {
                     .await?;
             }
             Command::Status => {
+                let active_repo_id = self.state.active_repo_id.as_deref();
+                let active_run = active_repo_id.and_then(|repo_id| self.active_runs.get(repo_id));
                 let approval_rule_count = self
                     .state
                     .active_repo_id
@@ -290,9 +376,12 @@ impl App {
                 let body = render_status(
                     self.state.active_repo(),
                     self.state.active_thread(),
-                    self.state.active_runtime_repo_id.as_deref(),
-                    self.state.active_turn_id.as_deref(),
-                    self.state.pending_request.as_ref(),
+                    active_repo_id.filter(|repo_id| self.runtimes.contains_key(*repo_id)),
+                    active_run.map(|run| run.turn_id.as_str()),
+                    active_run
+                        .and_then(|run| run.pending_request.as_ref())
+                        .map(pending_request_summary)
+                        .as_deref(),
                     approval_rule_count,
                 );
                 self.telegram.send_message(chat_id, &body, None).await?;
@@ -416,7 +505,12 @@ impl App {
                 self.telegram.send_message(chat_id, message, None).await?;
             }
             RepoCommand::Use { repo } => {
-                if self.state.active_turn_id.is_some() {
+                if self
+                    .state
+                    .active_repo_id
+                    .as_ref()
+                    .is_some_and(|repo_id| self.active_runs.contains_key(repo_id))
+                {
                     self.telegram
                         .send_message(
                             chat_id,
@@ -440,7 +534,12 @@ impl App {
                 self.telegram.send_message(chat_id, &body, None).await?;
             }
             RepoCommand::Clone { git_url, dir_name } => {
-                if self.state.active_turn_id.is_some() {
+                if self
+                    .state
+                    .active_repo_id
+                    .as_ref()
+                    .is_some_and(|repo_id| self.active_runs.contains_key(repo_id))
+                {
                     self.telegram
                         .send_message(
                             chat_id,
@@ -510,7 +609,7 @@ impl App {
                 self.telegram.send_message(chat_id, &body, None).await?;
             }
             ThreadCommand::New => {
-                if self.state.active_turn_id.is_some() {
+                if self.active_runs.contains_key(&active_repo_id) {
                     self.telegram
                         .send_message(
                             chat_id,
@@ -521,7 +620,9 @@ impl App {
                     return Ok(());
                 }
                 let model = self.config.codex.model.clone();
-                let runtime = self.ensure_runtime_for_repo(&active_repo_id).await?;
+                let runtime = self
+                    .ensure_runtime_for_repo(&active_repo_id, None, ThreadSurface::Telegram)
+                    .await?;
                 let response = runtime.create_thread(model).await?;
                 let title = format!("Thread {}", Utc::now().format("%Y-%m-%d %H:%M"));
                 let thread = self.state.create_thread_for_repo(
@@ -530,6 +631,7 @@ impl App {
                     response.thread.path,
                     title,
                     false,
+                    ThreadSurface::Telegram,
                 )?;
                 self.persist_state()?;
                 self.telegram
@@ -545,7 +647,7 @@ impl App {
                     .await?;
             }
             ThreadCommand::Use { thread } => {
-                if self.state.active_turn_id.is_some() {
+                if self.active_runs.contains_key(&active_repo_id) {
                     self.telegram
                         .send_message(
                             chat_id,
@@ -562,12 +664,18 @@ impl App {
                     .clone();
                 let thread = self
                     .state
-                    .resolve_thread_ref(&repo, &thread)
+                    .resolve_thread_ref_for_surface(&repo, &thread, ThreadSurface::Telegram)
                     .cloned()
                     .context("thread not found")?;
                 self.use_repo(active_repo_id.clone()).await?;
                 let model = self.config.codex.model.clone();
-                let runtime = self.ensure_runtime_for_repo(&active_repo_id).await?;
+                let runtime = self
+                    .ensure_runtime_for_repo(
+                        &active_repo_id,
+                        Some(&thread),
+                        ThreadSurface::Telegram,
+                    )
+                    .await?;
                 let response = runtime
                     .resume_thread(
                         thread.codex_thread_id.clone(),
@@ -578,11 +686,15 @@ impl App {
                 self.state.update_thread_runtime_metadata(
                     &active_repo_id,
                     &thread.local_thread_id,
+                    ThreadSurface::Telegram,
                     response.thread.id,
                     response.thread.path,
                 )?;
-                self.state
-                    .activate_thread(&active_repo_id, &thread.local_thread_id)?;
+                self.state.activate_thread(
+                    &active_repo_id,
+                    &thread.local_thread_id,
+                    ThreadSurface::Telegram,
+                )?;
                 self.persist_state()?;
                 self.telegram
                     .send_message(
@@ -848,17 +960,6 @@ impl App {
     }
 
     async fn handle_text(&mut self, chat_id: i64, text: String) -> Result<()> {
-        if self.state.active_turn_id.is_some() {
-            self.telegram
-                .send_message(
-                    chat_id,
-                    "A turn is already running. Wait for it or use /abort.",
-                    None,
-                )
-                .await?;
-            return Ok(());
-        }
-
         let repo_id = match self.state.active_repo_id.clone() {
             Some(repo_id) => repo_id,
             None => {
@@ -872,20 +973,25 @@ impl App {
                 return Ok(());
             }
         };
+        if self.active_runs.contains_key(&repo_id) {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    "This repo already has a running turn. Wait for it or use /abort.",
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
 
         self.use_repo(repo_id.clone()).await?;
 
-        let _repo = self
-            .state
-            .find_repo_by_id(&repo_id)
-            .cloned()
-            .context("active repo missing")?;
-        let active_thread = if let Some(thread) = self.state.active_thread().cloned() {
+        let mut active_thread = if let Some(thread) = self.state.active_thread().cloned() {
             thread
         } else {
             let model = self.config.codex.model.clone();
             let response = self
-                .ensure_runtime_for_repo(&repo_id)
+                .ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                 .await?
                 .create_thread(model)
                 .await?;
@@ -896,6 +1002,7 @@ impl App {
                 response.thread.path,
                 title,
                 true,
+                ThreadSurface::Telegram,
             )?;
             self.persist_state()?;
             thread
@@ -903,14 +1010,22 @@ impl App {
 
         if !active_thread.has_user_message {
             let title = title_from_text(&text);
-            self.state.update_active_thread_title(title);
+            self.state.update_thread_title(
+                &repo_id,
+                &active_thread.local_thread_id,
+                ThreadSurface::Telegram,
+                title.clone(),
+            )?;
             self.persist_state()?;
+            active_thread.title = title;
+            active_thread.has_user_message = true;
         }
 
         let model = self.config.codex.model.clone();
         let network_access = self.config.codex.network_access;
-        let runtime = self.ensure_runtime_for_repo(&repo_id).await?;
-        let response = runtime
+        let response = self
+            .ensure_runtime_for_repo(&repo_id, Some(&active_thread), ThreadSurface::Telegram)
+            .await?
             .start_turn(
                 active_thread.codex_thread_id.clone(),
                 text,
@@ -923,22 +1038,25 @@ impl App {
             .telegram
             .send_message(chat_id, "Starting Codex turn...", None)
             .await?;
-
-        self.state.active_turn_id = Some(response.turn.id.clone());
-        self.state.progress_message_id = Some(progress.message_id);
-        self.active_file_changes.clear();
-        self.progress = Some(ActiveProgress {
-            chat_id,
-            repo_id: repo_id.clone(),
-            thread_local_id: active_thread.local_thread_id.clone(),
-            message_id: progress.message_id,
-            assistant_text: String::new(),
-            command_output_tail: String::new(),
-            diff_preview: String::new(),
-            last_rendered_at: None,
-        });
-        self.persist_state()?;
-        self.render_progress(false).await?;
+        self.active_file_changes.remove(&repo_id);
+        self.active_runs.insert(
+            repo_id.clone(),
+            ActiveRun {
+                surface: ThreadSurface::Telegram,
+                thread_local_id: active_thread.local_thread_id,
+                turn_id: response.turn.id,
+                assistant_text: String::new(),
+                command_output_tail: String::new(),
+                diff_preview: String::new(),
+                route: RunRoute::Telegram {
+                    chat_id,
+                    message_id: progress.message_id,
+                    last_rendered_at: None,
+                },
+                pending_request: None,
+            },
+        );
+        self.render_progress_for_repo(&repo_id, false).await?;
         Ok(())
     }
 
@@ -960,51 +1078,29 @@ impl App {
             return Ok(());
         }
         let (action, callback_request_id) = parsed.expect("checked is_some above");
-
-        let pending = match self.state.pending_request.clone() {
-            Some(pending) => pending,
-            None => {
-                self.mark_callback_inactive(&callback, "no longer active")
-                    .await?;
-                return Ok(());
-            }
-        };
-        if pending_request_id(&pending) != &callback_request_id {
+        let Some((repo_id, pending)) = self.find_pending_request(&callback_request_id) else {
             self.mark_callback_inactive(&callback, "no longer active")
                 .await?;
             return Ok(());
-        }
+        };
 
         match (pending, action.as_str()) {
-            (
-                PendingRequest::CommandApproval {
-                    request_id,
-                    repo_id,
-                    thread_title: _,
-                    ..
-                },
-                "cmd:approve",
-            ) => {
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+            (RuntimePendingRequest::Command(pending), "cmd:approve") => {
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Accept)
+                    .respond_command_approval(
+                        pending.request_id,
+                        CommandExecutionApprovalDecision::Accept,
+                    )
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Command approved."))
                     .await?;
-                self.cleanup_pending_request(Some("approved")).await?;
+                self.cleanup_pending_request(&repo_id, Some("approved"))
+                    .await?;
             }
-            (
-                PendingRequest::CommandApproval {
-                    request_id,
-                    repo_id,
-                    command,
-                    ..
-                },
-                "cmd:allow",
-            ) => {
-                let Some(command) = command else {
+            (RuntimePendingRequest::Command(pending), "cmd:allow") => {
+                let Some(command) = pending.command else {
                     self.telegram
                         .answer_callback_query(
                             &callback.id,
@@ -1015,92 +1111,71 @@ impl App {
                 };
                 let rule = self.state.add_approval_rule(&repo_id, command.clone());
                 self.persist_state()?;
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Accept)
+                    .respond_command_approval(
+                        pending.request_id,
+                        CommandExecutionApprovalDecision::Accept,
+                    )
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Command approved and saved."))
                     .await?;
-                self.cleanup_pending_request(Some(&format!(
-                    "approved and saved [{}]",
-                    short_id(&rule.rule_id)
-                )))
+                self.cleanup_pending_request(
+                    &repo_id,
+                    Some(&format!("approved and saved [{}]", short_id(&rule.rule_id))),
+                )
                 .await?;
             }
-            (
-                PendingRequest::CommandApproval {
-                    request_id,
-                    repo_id,
-                    ..
-                },
-                "cmd:decline",
-            ) => {
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+            (RuntimePendingRequest::Command(pending), "cmd:decline") => {
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Decline)
+                    .respond_command_approval(
+                        pending.request_id,
+                        CommandExecutionApprovalDecision::Decline,
+                    )
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Command declined."))
                     .await?;
-                self.cleanup_pending_request(Some("declined")).await?;
+                self.cleanup_pending_request(&repo_id, Some("declined"))
+                    .await?;
             }
-            (
-                PendingRequest::CommandApproval {
-                    request_id,
-                    repo_id,
-                    ..
-                },
-                "cmd:abort",
-            ) => {
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+            (RuntimePendingRequest::Command(pending), "cmd:abort") => {
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_command_approval(request_id, CommandExecutionApprovalDecision::Cancel)
+                    .respond_command_approval(
+                        pending.request_id,
+                        CommandExecutionApprovalDecision::Cancel,
+                    )
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Turn abort requested."))
                     .await?;
-                self.cleanup_pending_request(Some("abort requested"))
+                self.cleanup_pending_request(&repo_id, Some("abort requested"))
                     .await?;
             }
-            (
-                PendingRequest::FileApproval {
-                    request_id,
-                    repo_id,
-                    ..
-                },
-                "patch:approve",
-            ) => {
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+            (RuntimePendingRequest::File(pending), "patch:approve") => {
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_file_approval(request_id, FileChangeApprovalDecision::Accept)
+                    .respond_file_approval(pending.request_id, FileChangeApprovalDecision::Accept)
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Patch approved."))
                     .await?;
-                self.cleanup_pending_request(Some("approved")).await?;
+                self.cleanup_pending_request(&repo_id, Some("approved"))
+                    .await?;
             }
-            (
-                PendingRequest::FileApproval {
-                    request_id,
-                    repo_id,
-                    ..
-                },
-                "patch:decline",
-            ) => {
-                self.use_repo(repo_id.clone()).await?;
-                self.ensure_runtime_for_repo(&repo_id)
+            (RuntimePendingRequest::File(pending), "patch:decline") => {
+                self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
                     .await?
-                    .respond_file_approval(request_id, FileChangeApprovalDecision::Decline)
+                    .respond_file_approval(pending.request_id, FileChangeApprovalDecision::Decline)
                     .await?;
                 self.telegram
                     .answer_callback_query(&callback.id, Some("Patch declined."))
                     .await?;
-                self.cleanup_pending_request(Some("declined")).await?;
+                self.cleanup_pending_request(&repo_id, Some("declined"))
+                    .await?;
             }
             _ => {
                 self.telegram
@@ -1114,64 +1189,167 @@ impl App {
     async fn handle_codex_event(&mut self, event: CodexEvent) -> Result<()> {
         match event {
             CodexEvent::TurnStarted { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() == Some(repo_id.as_str()) {
-                    self.state.active_turn_id = Some(payload.turn.id);
-                    self.persist_state()?;
+                let mut app_target = None;
+                if let Some(run) = self.active_runs.get_mut(&repo_id) {
+                    run.turn_id = payload.turn.id.clone();
+                    if let RunRoute::App { device_id } = &run.route {
+                        app_target = Some((device_id.clone(), run.thread_local_id.clone()));
+                    }
+                }
+                if let Some((device_id, thread_id)) = app_target {
+                    self.emit_app_event(
+                        &device_id,
+                        "run.started",
+                        serde_json::json!({
+                            "repo_id": repo_id,
+                            "thread_id": thread_id,
+                            "turn_id": payload.turn.id,
+                        }),
+                    )
+                    .await;
                 }
             }
             CodexEvent::TurnCompleted { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
-                    return Ok(());
-                }
-                if self.state.active_turn_id.as_deref() != Some(payload.turn.id.as_str()) {
+                if self
+                    .active_runs
+                    .get(&repo_id)
+                    .map(|run| run.turn_id.as_str())
+                    != Some(payload.turn.id.as_str())
+                {
                     return Ok(());
                 }
                 self.finish_turn(
+                    &repo_id,
                     &payload.turn.status,
-                    payload.turn.error.as_ref().map(|e| e.message.as_str()),
+                    payload
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.as_str()),
                 )
                 .await?;
             }
             CodexEvent::AgentMessageDelta { repo_id, payload } => {
-                if let Some(progress) = self.progress.as_mut() {
-                    if progress.repo_id == repo_id {
-                        progress.assistant_text.push_str(&payload.delta);
-                        self.render_progress(false).await?;
+                let delta = payload.delta;
+                let mut app_target = None;
+                let mut should_render = false;
+                if let Some(run) = self.active_runs.get_mut(&repo_id) {
+                    run.assistant_text.push_str(&delta);
+                    match &run.route {
+                        RunRoute::Telegram { .. } => should_render = true,
+                        RunRoute::App { device_id } => {
+                            app_target = Some((
+                                device_id.clone(),
+                                run.thread_local_id.clone(),
+                                run.turn_id.clone(),
+                                run.assistant_text.clone(),
+                            ));
+                        }
                     }
+                }
+                if should_render {
+                    self.render_progress_for_repo(&repo_id, false).await?;
+                }
+                if let Some((device_id, thread_id, turn_id, assistant_text)) = app_target {
+                    self.emit_app_event(
+                        &device_id,
+                        "run.delta",
+                        serde_json::json!({
+                            "repo_id": repo_id,
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "delta": delta,
+                            "assistant_text": assistant_text,
+                        }),
+                    )
+                    .await;
                 }
             }
             CodexEvent::CommandOutputDelta { repo_id, payload } => {
-                if let Some(progress) = self.progress.as_mut() {
-                    if progress.repo_id == repo_id {
-                        progress.command_output_tail.push_str(&payload.delta);
-                        progress.command_output_tail =
-                            trim_output_tail(&progress.command_output_tail, 4_000);
-                        self.render_progress(false).await?;
+                let delta = payload.delta;
+                let mut app_target = None;
+                let mut should_render = false;
+                if let Some(run) = self.active_runs.get_mut(&repo_id) {
+                    run.command_output_tail.push_str(&delta);
+                    run.command_output_tail = trim_output_tail(&run.command_output_tail, 4_000);
+                    match &run.route {
+                        RunRoute::Telegram { .. } => should_render = true,
+                        RunRoute::App { device_id } => {
+                            app_target = Some((
+                                device_id.clone(),
+                                run.thread_local_id.clone(),
+                                run.turn_id.clone(),
+                                run.command_output_tail.clone(),
+                            ));
+                        }
                     }
+                }
+                if should_render {
+                    self.render_progress_for_repo(&repo_id, false).await?;
+                }
+                if let Some((device_id, thread_id, turn_id, command_output_tail)) = app_target {
+                    self.emit_app_event(
+                        &device_id,
+                        "run.command_output",
+                        serde_json::json!({
+                            "repo_id": repo_id,
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "delta": delta,
+                            "command_output_tail": command_output_tail,
+                        }),
+                    )
+                    .await;
                 }
             }
             CodexEvent::DiffUpdated { repo_id, payload } => {
-                if let Some(progress) = self.progress.as_mut() {
-                    if progress.repo_id == repo_id {
-                        progress.diff_preview = payload.diff;
-                        self.render_progress(false).await?;
+                let diff = payload.diff;
+                let mut app_target = None;
+                let mut should_render = false;
+                if let Some(run) = self.active_runs.get_mut(&repo_id) {
+                    run.diff_preview = diff.clone();
+                    match &run.route {
+                        RunRoute::Telegram { .. } => should_render = true,
+                        RunRoute::App { device_id } => {
+                            app_target = Some((
+                                device_id.clone(),
+                                run.thread_local_id.clone(),
+                                run.turn_id.clone(),
+                                run.diff_preview.clone(),
+                            ));
+                        }
                     }
+                }
+                if should_render {
+                    self.render_progress_for_repo(&repo_id, false).await?;
+                }
+                if let Some((device_id, thread_id, turn_id, diff_preview)) = app_target {
+                    self.emit_app_event(
+                        &device_id,
+                        "run.diff",
+                        serde_json::json!({
+                            "repo_id": repo_id,
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "diff_preview": diff_preview,
+                        }),
+                    )
+                    .await;
                 }
             }
             CodexEvent::ItemStarted { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
-                    return Ok(());
-                }
                 if let ThreadItem::FileChange { id, changes, .. } = payload.item {
-                    self.active_file_changes.insert(id, changes);
+                    self.active_file_changes
+                        .entry(repo_id)
+                        .or_default()
+                        .insert(id, changes);
                 }
             }
             CodexEvent::ItemCompleted { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
-                    return Ok(());
-                }
                 if let ThreadItem::FileChange { id, .. } = payload.item {
-                    self.active_file_changes.remove(&id);
+                    if let Some(items) = self.active_file_changes.get_mut(&repo_id) {
+                        items.remove(&id);
+                    }
                 }
             }
             CodexEvent::CommandApprovalRequested {
@@ -1190,32 +1368,35 @@ impl App {
                 self.on_file_approval(repo_id, request_id, params).await?;
             }
             CodexEvent::ServerRequestResolved { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
-                    return Ok(());
-                }
                 if self
-                    .state
-                    .pending_request
-                    .as_ref()
+                    .active_runs
+                    .get(&repo_id)
+                    .and_then(|run| run.pending_request.as_ref())
                     .map(|pending| pending_request_id(pending) == &payload.request_id)
                     .unwrap_or(false)
                 {
-                    self.cleanup_pending_request(Some("processed")).await?;
+                    self.cleanup_pending_request(&repo_id, Some("processed"))
+                        .await?;
                 }
             }
             CodexEvent::Error { repo_id, payload } => {
-                if self.state.active_repo_id.as_deref() != Some(repo_id.as_str()) {
-                    return Ok(());
-                }
                 warn!(
                     "codex turn error thread={} turn={} retry={}: {}",
                     payload.thread_id, payload.turn_id, payload.will_retry, payload.error.message
                 );
                 if !payload.will_retry
-                    && self.state.active_turn_id.as_deref() == Some(payload.turn_id.as_str())
+                    && self
+                        .active_runs
+                        .get(&repo_id)
+                        .map(|run| run.turn_id.as_str())
+                        == Some(payload.turn_id.as_str())
                 {
-                    self.finish_turn(&TurnStatus::Failed, Some(payload.error.message.as_str()))
-                        .await?;
+                    self.finish_turn(
+                        &repo_id,
+                        &TurnStatus::Failed,
+                        Some(payload.error.message.as_str()),
+                    )
+                    .await?;
                 }
             }
             CodexEvent::RuntimeExited {
@@ -1223,14 +1404,8 @@ impl App {
                 status_code,
                 error,
             } => {
-                if self.state.active_runtime_repo_id.as_deref() == Some(repo_id.as_str()) {
-                    self.state.active_runtime_repo_id = None;
-                    self.persist_state()?;
-                }
-                warn!(
-                    "codex runtime exited for repo {} status={:?} error={:?}",
-                    repo_id, status_code, error
-                );
+                self.on_runtime_exited(&repo_id, status_code, error.as_deref(), None)
+                    .await?;
             }
         }
         Ok(())
@@ -1247,12 +1422,16 @@ impl App {
             .find_repo_by_id(&repo_id)
             .cloned()
             .context("approval repo missing")?;
+        let run = self
+            .active_runs
+            .get(&repo_id)
+            .cloned()
+            .context("approval run missing")?;
         let thread = self
             .state
-            .active_thread()
+            .find_thread_for_surface(&repo_id, &run.thread_local_id, run.surface)
             .cloned()
             .context("approval thread missing")?;
-        let chat_id = self.active_chat_id()?;
         let body = render_command_approval(
             &repo.name,
             &thread.title,
@@ -1263,7 +1442,7 @@ impl App {
         if let Some(command) = params.command.as_deref() {
             if let Some(rule) = self.state.find_matching_approval_rule(&repo_id, command) {
                 let rule_id = rule.rule_id.clone();
-                self.ensure_runtime_for_repo(&repo_id)
+                self.ensure_runtime_for_repo(&repo_id, None, run.surface)
                     .await?
                     .respond_command_approval(request_id, CommandExecutionApprovalDecision::Accept)
                     .await?;
@@ -1276,33 +1455,60 @@ impl App {
                 return Ok(());
             }
         }
-        if self.state.pending_request.is_some() {
-            self.cleanup_pending_request(Some("superseded by a newer approval"))
+        if run.pending_request.is_some() {
+            self.cleanup_pending_request(&repo_id, Some("superseded by a newer approval"))
                 .await?;
         }
-        let approval_message = self
-            .telegram
-            .send_message(
-                chat_id,
-                &body,
-                Some(&command_approval_keyboard(&request_id)),
-            )
-            .await?;
-        self.state.pending_request = Some(PendingRequest::CommandApproval {
-            request_id,
-            repo_id,
-            thread_local_id: thread.local_thread_id,
-            thread_title: thread.title,
-            approval_chat_id: chat_id,
-            approval_message_id: approval_message.message_id,
-            approval_message_text: body,
-            turn_id: params.turn_id,
-            item_id: params.item_id,
-            command: params.command,
-            cwd: params.cwd,
-            reason: params.reason,
-        });
-        self.persist_state()?;
+
+        let telegram_message = match &run.route {
+            RunRoute::Telegram { chat_id, .. } => {
+                let approval_message = self
+                    .telegram
+                    .send_message(
+                        *chat_id,
+                        &body,
+                        Some(&command_approval_keyboard(&request_id)),
+                    )
+                    .await?;
+                Some(TelegramApprovalMessage {
+                    chat_id: *chat_id,
+                    message_id: approval_message.message_id,
+                    text: body.clone(),
+                })
+            }
+            RunRoute::App { device_id } => {
+                self.emit_app_event(
+                    device_id,
+                    "run.approval_required",
+                    serde_json::json!({
+                        "repo_id": repo_id.clone(),
+                        "thread_id": thread.local_thread_id.clone(),
+                        "turn_id": params.turn_id.clone(),
+                        "request_id": request_id.clone(),
+                        "kind": "command",
+                        "thread_title": thread.title.clone(),
+                        "command": params.command.clone(),
+                        "cwd": params.cwd.clone(),
+                        "reason": params.reason.clone(),
+                    }),
+                )
+                .await;
+                None
+            }
+        };
+
+        if let Some(run) = self.active_runs.get_mut(&repo_id) {
+            run.pending_request = Some(RuntimePendingRequest::Command(CommandPendingRequest {
+                request_id,
+                thread_title: thread.title,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                command: params.command,
+                cwd: params.cwd,
+                reason: params.reason,
+                telegram_message,
+            }));
+        }
         Ok(())
     }
 
@@ -1317,15 +1523,20 @@ impl App {
             .find_repo_by_id(&repo_id)
             .cloned()
             .context("approval repo missing")?;
+        let run = self
+            .active_runs
+            .get(&repo_id)
+            .cloned()
+            .context("approval run missing")?;
         let thread = self
             .state
-            .active_thread()
+            .find_thread_for_surface(&repo_id, &run.thread_local_id, run.surface)
             .cloned()
             .context("approval thread missing")?;
-        let chat_id = self.active_chat_id()?;
         let changes = self
             .active_file_changes
-            .get(&params.item_id)
+            .get(&repo_id)
+            .and_then(|items| items.get(&params.item_id))
             .cloned()
             .unwrap_or_default();
         let paths = changes
@@ -1337,18 +1548,10 @@ impl App {
             .map(|change| change.diff.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let patch_path = if diff_preview.len() > self.config.ui.max_inline_diff_chars {
-            let path = self
-                .config
-                .temp_dir()
-                .join(format!("{}.patch", params.item_id.replace('/', "_")));
-            tokio::fs::write(&path, diff_preview.as_bytes())
-                .await
-                .with_context(|| format!("failed to write {}", path.display()))?;
-            Some(path)
-        } else {
-            None
-        };
+        if run.pending_request.is_some() {
+            self.cleanup_pending_request(&repo_id, Some("superseded by a newer approval"))
+                .await?;
+        }
 
         let caption = render_file_approval(
             &repo.name,
@@ -1357,146 +1560,187 @@ impl App {
             params.reason.as_deref(),
             &diff_preview,
         );
-        if self.state.pending_request.is_some() {
-            self.cleanup_pending_request(Some("superseded by a newer approval"))
-                .await?;
-        }
-
-        let pending_request = if let Some(path) = patch_path {
-            self.telegram
-                .send_document(chat_id, &path, &caption)
-                .await?;
-            let message = self
-                .telegram
-                .send_message(
-                    chat_id,
-                    "Use the buttons below to approve or decline this patch.",
-                    Some(&file_approval_keyboard(&request_id)),
+        let (patch_path, telegram_message) = match &run.route {
+            RunRoute::Telegram { chat_id, .. } => {
+                let patch_path = if diff_preview.len() > self.config.ui.max_inline_diff_chars {
+                    let path = self
+                        .config
+                        .temp_dir()
+                        .join(format!("{}.patch", params.item_id.replace('/', "_")));
+                    tokio::fs::write(&path, diff_preview.as_bytes())
+                        .await
+                        .with_context(|| format!("failed to write {}", path.display()))?;
+                    self.telegram
+                        .send_document(*chat_id, &path, &caption)
+                        .await?;
+                    Some(path)
+                } else {
+                    None
+                };
+                let prompt = if patch_path.is_some() {
+                    "Use the buttons below to approve or decline this patch.".to_string()
+                } else {
+                    caption.clone()
+                };
+                let message = self
+                    .telegram
+                    .send_message(
+                        *chat_id,
+                        &prompt,
+                        Some(&file_approval_keyboard(&request_id)),
+                    )
+                    .await?;
+                (
+                    patch_path,
+                    Some(TelegramApprovalMessage {
+                        chat_id: *chat_id,
+                        message_id: message.message_id,
+                        text: prompt,
+                    }),
                 )
-                .await?;
-            PendingRequest::FileApproval {
-                request_id,
-                repo_id: repo_id.clone(),
-                thread_local_id: thread.local_thread_id.clone(),
-                thread_title: thread.title.clone(),
-                approval_chat_id: chat_id,
-                approval_message_id: message.message_id,
-                approval_message_text: "Use the buttons below to approve or decline this patch."
-                    .into(),
-                turn_id: params.turn_id.clone(),
-                item_id: params.item_id.clone(),
-                paths: paths.clone(),
-                reason: params.reason.clone(),
-                diff_preview: diff_preview.clone(),
-                patch_path: Some(path),
-                preferred_decision: FileChangeApprovalDecision::Accept,
             }
-        } else {
-            let message = self
-                .telegram
-                .send_message(
-                    chat_id,
-                    &caption,
-                    Some(&file_approval_keyboard(&request_id)),
+            RunRoute::App { device_id } => {
+                self.emit_app_event(
+                    device_id,
+                    "run.approval_required",
+                    serde_json::json!({
+                        "repo_id": repo_id.clone(),
+                        "thread_id": thread.local_thread_id.clone(),
+                        "turn_id": params.turn_id.clone(),
+                        "request_id": request_id.clone(),
+                        "kind": "file",
+                        "thread_title": thread.title.clone(),
+                        "paths": paths.clone(),
+                        "reason": params.reason.clone(),
+                        "diff_preview": diff_preview.clone(),
+                    }),
                 )
-                .await?;
-            PendingRequest::FileApproval {
-                request_id,
-                repo_id: repo_id.clone(),
-                thread_local_id: thread.local_thread_id.clone(),
-                thread_title: thread.title.clone(),
-                approval_chat_id: chat_id,
-                approval_message_id: message.message_id,
-                approval_message_text: caption,
-                turn_id: params.turn_id.clone(),
-                item_id: params.item_id.clone(),
-                paths: paths.clone(),
-                reason: params.reason.clone(),
-                diff_preview: diff_preview.clone(),
-                patch_path: None,
-                preferred_decision: FileChangeApprovalDecision::Accept,
+                .await;
+                (None, None)
             }
         };
-        self.state.pending_request = Some(pending_request);
-        self.persist_state()?;
+
+        if let Some(run) = self.active_runs.get_mut(&repo_id) {
+            run.pending_request = Some(RuntimePendingRequest::File(FilePendingRequest {
+                request_id,
+                thread_title: thread.title,
+                turn_id: params.turn_id,
+                item_id: params.item_id,
+                paths,
+                reason: params.reason,
+                diff_preview,
+                patch_path,
+                preferred_decision: FileChangeApprovalDecision::Accept,
+                telegram_message,
+            }));
+        }
         Ok(())
     }
 
     async fn finish_turn(
         &mut self,
+        repo_id: &str,
         status: &TurnStatus,
         error_message: Option<&str>,
     ) -> Result<()> {
-        let final_text = if let Some(progress) = self.progress.as_ref() {
-            if progress.assistant_text.is_empty() {
-                status_label(status).to_string()
-            } else {
-                progress.assistant_text.clone()
-            }
-        } else {
+        let Some(run) = self.active_runs.get(repo_id).cloned() else {
+            return Ok(());
+        };
+        let final_text = if run.assistant_text.is_empty() {
             status_label(status).to_string()
+        } else {
+            run.assistant_text.clone()
         };
 
-        self.render_progress(true).await?;
+        if matches!(run.route, RunRoute::Telegram { .. }) {
+            self.render_progress_for_repo(repo_id, true).await?;
+        }
 
-        if let Some(progress) = &self.progress {
-            let chunks = split_message(&final_text);
-            if chunks.len() > 1 {
-                let summary = format!(
-                    "repo: {}\nthread: {}\nstatus: {}\n\nFull response sent in {} parts.",
-                    self.state
-                        .find_repo_by_id(&progress.repo_id)
+        match &run.route {
+            RunRoute::Telegram {
+                chat_id,
+                message_id,
+                ..
+            } => {
+                let chunks = split_message(&final_text);
+                if chunks.len() > 1 {
+                    let repo_name = self
+                        .state
+                        .find_repo_by_id(repo_id)
                         .map(|repo| repo.name.clone())
-                        .unwrap_or_else(|| "unknown".into()),
-                    self.state
-                        .find_repo_by_id(&progress.repo_id)
-                        .and_then(|repo| repo
-                            .threads
-                            .iter()
-                            .find(|thread| thread.local_thread_id == progress.thread_local_id))
+                        .unwrap_or_else(|| repo_id.to_string());
+                    let thread_title = self
+                        .state
+                        .find_thread_for_surface(repo_id, &run.thread_local_id, run.surface)
                         .map(|thread| thread.title.clone())
-                        .unwrap_or_else(|| "unknown".into()),
-                    status_label(status),
-                    chunks.len()
-                );
-                let _ = self
-                    .telegram
-                    .edit_message_text(progress.chat_id, progress.message_id, &summary, None)
-                    .await;
-                for chunk in chunks {
+                        .unwrap_or_else(|| run.thread_local_id.clone());
+                    let summary = format!(
+                        "repo: {repo_name}\nthread: {thread_title}\nstatus: {}\n\nFull response sent in {} parts.",
+                        status_label(status),
+                        chunks.len()
+                    );
+                    let _ = self
+                        .telegram
+                        .edit_message_text(*chat_id, *message_id, &summary, None)
+                        .await;
+                    for chunk in chunks {
+                        self.telegram.send_message(*chat_id, &chunk, None).await?;
+                    }
+                }
+                if let Some(error_message) = error_message {
                     self.telegram
-                        .send_message(progress.chat_id, &chunk, None)
+                        .send_message(
+                            *chat_id,
+                            &format!("Turn ended with error: {error_message}"),
+                            None,
+                        )
                         .await?;
                 }
             }
-        }
-
-        if let Some(error_message) = error_message {
-            if let Some(chat_id) = self.progress.as_ref().map(|progress| progress.chat_id) {
-                self.telegram
-                    .send_message(
-                        chat_id,
-                        &format!("Turn ended with error: {error_message}"),
-                        None,
-                    )
-                    .await?;
+            RunRoute::App { device_id } => {
+                let method = if matches!(status, TurnStatus::Failed | TurnStatus::Interrupted) {
+                    "run.failed"
+                } else {
+                    "run.completed"
+                };
+                self.emit_app_event(
+                    device_id,
+                    method,
+                    serde_json::json!({
+                        "repo_id": repo_id,
+                        "thread_id": run.thread_local_id,
+                        "turn_id": run.turn_id,
+                        "status": status_label(status),
+                        "assistant_text": final_text,
+                        "command_output_tail": run.command_output_tail,
+                        "diff_preview": run.diff_preview,
+                        "error": error_message,
+                    }),
+                )
+                .await;
             }
         }
 
-        self.state.active_turn_id = None;
-        self.state.progress_message_id = None;
-        self.cleanup_pending_request(Some("no longer active"))
+        self.cleanup_pending_request(repo_id, Some("no longer active"))
             .await?;
-        self.progress = None;
-        self.active_file_changes.clear();
-        self.persist_state()?;
+        self.active_runs.remove(repo_id);
+        self.active_file_changes.remove(repo_id);
         Ok(())
     }
 
     async fn abort_active_turn(&mut self, chat_id: i64) -> Result<()> {
-        let turn_id = match self.state.active_turn_id.clone() {
-            Some(turn_id) => turn_id,
+        let repo_id = match self.state.active_repo_id.clone() {
+            Some(repo_id) => repo_id,
             None => {
+                self.telegram
+                    .send_message(chat_id, "No active repo is selected.", None)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let run = match self.active_runs.get(&repo_id).cloned() {
+            Some(run) if run.surface == ThreadSurface::Telegram => run,
+            _ => {
                 self.telegram
                     .send_message(chat_id, "No active turn is running.", None)
                     .await?;
@@ -1505,17 +1749,12 @@ impl App {
         };
         let thread = self
             .state
-            .active_thread()
+            .find_thread_for_surface(&repo_id, &run.thread_local_id, ThreadSurface::Telegram)
             .cloned()
             .context("active thread missing")?;
-        let repo_id = self
-            .state
-            .active_repo_id
-            .clone()
-            .context("active repo missing")?;
-        self.ensure_runtime_for_repo(&repo_id)
+        self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
             .await?
-            .interrupt_turn(thread.codex_thread_id, turn_id)
+            .interrupt_turn(thread.codex_thread_id, run.turn_id)
             .await?;
         self.telegram
             .send_message(chat_id, "Turn interrupt requested.", None)
@@ -1523,14 +1762,21 @@ impl App {
         Ok(())
     }
 
-    async fn render_progress(&mut self, force: bool) -> Result<()> {
-        let Some(progress) = self.progress.as_mut() else {
+    async fn render_progress_for_repo(&mut self, repo_id: &str, force: bool) -> Result<()> {
+        let Some(run) = self.active_runs.get(repo_id) else {
             return Ok(());
+        };
+        let (chat_id, message_id, last_rendered_at) = match &run.route {
+            RunRoute::Telegram {
+                chat_id,
+                message_id,
+                last_rendered_at,
+            } => (*chat_id, *message_id, *last_rendered_at),
+            RunRoute::App { .. } => return Ok(()),
         };
 
         let should_render = force
-            || progress
-                .last_rendered_at
+            || last_rendered_at
                 .map(|last| {
                     last.elapsed() >= Duration::from_millis(self.config.ui.stream_edit_interval_ms)
                 })
@@ -1541,129 +1787,161 @@ impl App {
 
         let repo = self
             .state
-            .find_repo_by_id(&progress.repo_id)
+            .find_repo_by_id(repo_id)
             .context("progress repo missing")?;
-        let thread = repo
-            .threads
-            .iter()
-            .find(|thread| thread.local_thread_id == progress.thread_local_id)
+        let thread = self
+            .state
+            .find_thread_for_surface(repo_id, &run.thread_local_id, run.surface)
             .context("progress thread missing")?;
         let view = ProgressView {
             repo_name: repo.name.clone(),
             thread_title: thread.title.clone(),
-            status: status_label_from_state(self.state.active_turn_id.as_deref(), force),
-            assistant_text: progress.assistant_text.clone(),
-            command_output_tail: progress.command_output_tail.clone(),
-            diff_preview: progress.diff_preview.clone(),
+            status: status_label_from_state(Some(run.turn_id.as_str()), force),
+            assistant_text: run.assistant_text.clone(),
+            command_output_tail: run.command_output_tail.clone(),
+            diff_preview: run.diff_preview.clone(),
         };
 
         let rendered = render_progress(&view);
         self.telegram
-            .edit_message_text(progress.chat_id, progress.message_id, &rendered, None)
+            .edit_message_text(chat_id, message_id, &rendered, None)
             .await?;
-        progress.last_rendered_at = Some(Instant::now());
+        if let Some(ActiveRun {
+            route: RunRoute::Telegram {
+                last_rendered_at, ..
+            },
+            ..
+        }) = self.active_runs.get_mut(repo_id)
+        {
+            *last_rendered_at = Some(Instant::now());
+        }
         Ok(())
     }
 
-    async fn cleanup_pending_request(&mut self, status: Option<&str>) -> Result<()> {
-        if let Some(pending) = self.state.pending_request.clone() {
+    async fn cleanup_pending_request(&mut self, repo_id: &str, status: Option<&str>) -> Result<()> {
+        let pending = self
+            .active_runs
+            .get(repo_id)
+            .and_then(|run| run.pending_request.clone());
+        if let Some(pending) = pending {
             if let Some(status) = status {
                 if let Err(err) = self.update_pending_request_message(&pending, status).await {
                     warn!("failed to update pending approval message: {err}");
                 }
             }
-            if let PendingRequest::FileApproval {
+            if let RuntimePendingRequest::File(FilePendingRequest {
                 patch_path: Some(path),
                 ..
-            } = &pending
+            }) = &pending
             {
                 let _ = tokio::fs::remove_file(path).await;
             }
         }
-        self.state.pending_request = None;
-        self.persist_state()?;
+        if let Some(run) = self.active_runs.get_mut(repo_id) {
+            run.pending_request = None;
+        }
         Ok(())
     }
 
-    async fn reconcile_runtime_exit(&mut self, chat_id: Option<i64>) -> Result<()> {
-        let exit_status = match self.runtime.as_mut() {
-            Some(runtime) => runtime.try_wait()?,
-            None => None,
-        };
-        let Some(exit_status) = exit_status else {
-            return Ok(());
-        };
-
-        let runtime = self
-            .runtime
-            .take()
-            .context("runtime must exist after try_wait")?;
-        let repo_id = runtime.repo_id().to_string();
-        let repo_name = self
-            .state
-            .find_repo_by_id(&repo_id)
-            .map(|repo| repo.name.clone())
-            .unwrap_or_else(|| repo_id.clone());
-        let progress_snapshot = self.progress.clone();
-        let had_pending_request = self.state.pending_request.is_some();
-        let had_active_turn = self.state.active_turn_id.is_some() || progress_snapshot.is_some();
-        let _ = runtime.stop().await;
-
-        if self.state.active_runtime_repo_id.as_deref() == Some(repo_id.as_str()) {
-            self.state.active_runtime_repo_id = None;
+    async fn reconcile_runtime_exits(&mut self, chat_id: Option<i64>) -> Result<()> {
+        let mut exited = Vec::new();
+        for (repo_id, runtime) in &mut self.runtimes {
+            if let Some(status) = runtime.try_wait()? {
+                exited.push((repo_id.clone(), status.code()));
+            }
         }
-
-        if let Some(progress) = progress_snapshot.as_ref() {
-            let repo_label = self
-                .state
-                .find_repo_by_id(&progress.repo_id)
-                .map(|repo| repo.name.clone())
-                .unwrap_or_else(|| progress.repo_id.clone());
-            let thread_label = self
-                .state
-                .find_repo_by_id(&progress.repo_id)
-                .and_then(|repo| {
-                    repo.threads
-                        .iter()
-                        .find(|thread| thread.local_thread_id == progress.thread_local_id)
-                })
-                .map(|thread| thread.title.clone())
-                .unwrap_or_else(|| progress.thread_local_id.clone());
-            let _ = self
-                .telegram
-                .edit_message_text(
-                    progress.chat_id,
-                    progress.message_id,
-                    &format!("repo: {repo_label}\nthread: {thread_label}\nstatus: runtime exited"),
-                    None,
-                )
-                .await;
-        }
-
-        if had_pending_request {
-            self.cleanup_pending_request(Some("no longer active"))
+        for (repo_id, status_code) in exited {
+            self.on_runtime_exited(&repo_id, status_code, None, chat_id)
                 .await?;
         }
+        Ok(())
+    }
 
-        self.state.active_turn_id = None;
-        self.state.progress_message_id = None;
-        self.progress = None;
-        self.active_file_changes.clear();
-        self.persist_state()?;
+    async fn on_runtime_exited(
+        &mut self,
+        repo_id: &str,
+        status_code: Option<i32>,
+        error: Option<&str>,
+        chat_id: Option<i64>,
+    ) -> Result<()> {
+        if let Some(runtime) = self.runtimes.remove(repo_id) {
+            let _ = runtime.stop().await;
+        }
+        let repo_name = self
+            .state
+            .find_repo_by_id(repo_id)
+            .map(|repo| repo.name.clone())
+            .unwrap_or_else(|| repo_id.to_string());
+        let runtime_error = error
+            .map(|value| value.to_string())
+            .or_else(|| status_code.map(|code| format!("status {code}")));
+        let run_snapshot = self.active_runs.get(repo_id).cloned();
+        let had_pending = run_snapshot
+            .as_ref()
+            .and_then(|run| run.pending_request.as_ref())
+            .is_some();
+        if let Some(run) = run_snapshot.as_ref() {
+            match &run.route {
+                RunRoute::Telegram {
+                    chat_id,
+                    message_id,
+                    ..
+                } => {
+                    let thread_title = self
+                        .state
+                        .find_thread_for_surface(repo_id, &run.thread_local_id, run.surface)
+                        .map(|thread| thread.title.clone())
+                        .unwrap_or_else(|| run.thread_local_id.clone());
+                    let _ = self
+                        .telegram
+                        .edit_message_text(
+                            *chat_id,
+                            *message_id,
+                            &format!(
+                                "repo: {repo_name}\nthread: {thread_title}\nstatus: runtime exited"
+                            ),
+                            None,
+                        )
+                        .await;
+                }
+                RunRoute::App { device_id } => {
+                    self.emit_app_event(
+                        device_id,
+                        "run.failed",
+                        serde_json::json!({
+                            "repo_id": repo_id,
+                            "thread_id": run.thread_local_id,
+                            "turn_id": run.turn_id,
+                            "status": "runtime exited",
+                            "error": runtime_error,
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if had_pending {
+            self.cleanup_pending_request(repo_id, Some("no longer active"))
+                .await?;
+        }
+        self.active_runs.remove(repo_id);
+        self.active_file_changes.remove(repo_id);
 
         warn!(
-            "codex runtime exited for repo {} status={:?}; cleared active turn state",
-            repo_id,
-            exit_status.code()
+            "codex runtime exited for repo {} status={:?} error={:?}",
+            repo_id, status_code, error
         );
-
-        if had_active_turn || had_pending_request {
+        if let Some(RunRoute::Telegram {
+            chat_id: progress_chat,
+            ..
+        }) = run_snapshot.as_ref().map(|run| run.route.clone())
+        {
             let notify_chat_id = chat_id
-                .or_else(|| progress_snapshot.as_ref().map(|progress| progress.chat_id))
+                .or(Some(progress_chat))
                 .or(self.config.telegram.allowed_chat_id);
             if let Some(chat_id) = notify_chat_id {
-                let status = exit_status
-                    .code()
+                let status = status_code
                     .map(|code| format!("status {code}"))
                     .unwrap_or_else(|| "an unknown status".to_string());
                 self.telegram
@@ -1677,13 +1955,12 @@ impl App {
                     .await?;
             }
         }
-
         Ok(())
     }
 
     async fn update_pending_request_message(
         &self,
-        pending: &PendingRequest,
+        pending: &RuntimePendingRequest,
         status: &str,
     ) -> Result<()> {
         let Some((chat_id, message_id, text)) = pending_request_message_meta(pending) else {
@@ -1715,33 +1992,25 @@ impl App {
     }
 
     async fn use_repo(&mut self, repo_id: String) -> Result<()> {
-        if self.state.active_repo_id.as_deref() == Some(repo_id.as_str()) {
-            self.ensure_runtime_for_repo(&repo_id).await?;
-            return Ok(());
-        }
-
-        if let Some(runtime) = self.runtime.take() {
-            runtime.stop().await?;
-        }
-
         self.state.set_active_repo(repo_id.clone());
-        self.state.active_runtime_repo_id = None;
         self.state.mark_repo_used(&repo_id);
         self.persist_state()?;
-        self.ensure_runtime_for_repo(&repo_id).await?;
+        self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::Telegram)
+            .await?;
         Ok(())
     }
 
-    async fn ensure_runtime_for_repo(&mut self, repo_id: &str) -> Result<&mut CodexRuntime> {
-        if self.state.active_runtime_repo_id.as_deref() == Some(repo_id) && self.runtime.is_some() {
+    async fn ensure_runtime_for_repo(
+        &mut self,
+        repo_id: &str,
+        startup_thread: Option<&ThreadRecord>,
+        surface: ThreadSurface,
+    ) -> Result<&mut CodexRuntime> {
+        if self.runtimes.contains_key(repo_id) {
             return self
-                .runtime
-                .as_mut()
-                .context("runtime marked active but missing");
-        }
-
-        if let Some(runtime) = self.runtime.take() {
-            runtime.stop().await?;
+                .runtimes
+                .get_mut(repo_id)
+                .context("runtime map missing requested repo");
         }
 
         let repo = self
@@ -1749,7 +2018,6 @@ impl App {
             .find_repo_by_id(repo_id)
             .cloned()
             .with_context(|| format!("repo not found: {repo_id}"))?;
-        let active_thread = repo.active_thread().cloned();
         let mut runtime = CodexRuntime::start(
             &self.config.codex.bin,
             repo.repo_id.clone(),
@@ -1757,7 +2025,13 @@ impl App {
             self.codex_events_tx.clone(),
         )
         .await?;
-        if let Some(thread) = active_thread {
+
+        let resume_thread = startup_thread.cloned().or_else(|| {
+            (surface == ThreadSurface::Telegram)
+                .then(|| repo.active_thread().cloned())
+                .flatten()
+        });
+        if let Some(thread) = resume_thread {
             let model = self.config.codex.model.clone();
             let response = match runtime
                 .resume_thread(
@@ -1769,7 +2043,7 @@ impl App {
             {
                 Ok(response) => response,
                 Err(err) => {
-                    if is_missing_thread_resume_error(&err) {
+                    if surface == ThreadSurface::Telegram && is_missing_thread_resume_error(&err) {
                         let cleared = self.state.clear_active_thread(repo_id)?;
                         warn!(
                             "failed to resume active thread {} [{}] for repo {}: {}; cleared active thread and continuing with a fresh runtime",
@@ -1781,18 +2055,17 @@ impl App {
                             repo.name,
                             err
                         );
-                        self.state.active_runtime_repo_id = Some(repo.repo_id.clone());
                         self.persist_state()?;
-                        self.runtime = Some(runtime);
+                        self.runtimes.insert(repo_id.to_string(), runtime);
                         return self
-                            .runtime
-                            .as_mut()
+                            .runtimes
+                            .get_mut(repo_id)
                             .context("runtime must exist after startup");
                     }
                     let _ = runtime.stop().await;
                     return Err(err).with_context(|| {
                         format!(
-                            "failed to resume active thread {} [{}] for repo {}",
+                            "failed to resume thread {} [{}] for repo {}",
                             thread.title,
                             short_id(&thread.local_thread_id),
                             repo.name
@@ -1803,16 +2076,342 @@ impl App {
             self.state.update_thread_runtime_metadata(
                 repo_id,
                 &thread.local_thread_id,
+                thread.surface,
                 response.thread.id,
                 response.thread.path,
             )?;
+            self.persist_state()?;
         }
-        self.state.active_runtime_repo_id = Some(repo.repo_id.clone());
-        self.persist_state()?;
-        self.runtime = Some(runtime);
-        self.runtime
-            .as_mut()
+
+        self.runtimes.insert(repo_id.to_string(), runtime);
+        self.runtimes
+            .get_mut(repo_id)
             .context("runtime must exist after startup")
+    }
+
+    async fn handle_app_control_command(&mut self, command: AppControlCommand) {
+        match command {
+            AppControlCommand::ListRepos { reply, .. } => {
+                let result = serde_json::json!({
+                    "repos": self.state.repos.iter().map(|repo| {
+                        serde_json::json!({
+                            "repo_id": repo.repo_id,
+                            "name": repo.name,
+                            "path": repo.path,
+                            "origin_url": repo.origin_url,
+                            "app_thread_count": repo.threads_for_surface(ThreadSurface::App).len(),
+                        })
+                    }).collect::<Vec<_>>()
+                });
+                let _ = reply.send(Ok(result));
+            }
+            AppControlCommand::ListThreads { repo_id, reply, .. } => {
+                let result = (|| -> std::result::Result<Value, AppControlError> {
+                    let repo = self
+                        .state
+                        .find_repo_by_id(&repo_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppControlError::not_found(format!("repo not found: {repo_id}"))
+                        })?;
+                    Ok(serde_json::json!({
+                        "repo_id": repo.repo_id,
+                        "threads": repo.threads_for_surface(ThreadSurface::App)
+                            .into_iter()
+                            .map(|thread| self.app_thread_summary(&repo.repo_id, thread))
+                            .collect::<Vec<_>>(),
+                    }))
+                })();
+                let _ = reply.send(result);
+            }
+            AppControlCommand::CreateThread {
+                repo_id,
+                title,
+                reply,
+                ..
+            } => {
+                let result = async {
+                    let repo = self
+                        .state
+                        .find_repo_by_id(&repo_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppControlError::not_found(format!("repo not found: {repo_id}"))
+                        })?;
+                    let model = self.config.codex.model.clone();
+                    let response = self
+                        .ensure_runtime_for_repo(&repo.repo_id, None, ThreadSurface::App)
+                        .await
+                        .map_err(|err| AppControlError::internal(err.to_string()))?
+                        .create_thread(model)
+                        .await
+                        .map_err(|err| AppControlError::internal(err.to_string()))?;
+                    let thread = self
+                        .state
+                        .create_thread_for_repo(
+                            &repo.repo_id,
+                            response.thread.id,
+                            response.thread.path,
+                            title.unwrap_or_else(|| {
+                                format!("Thread {}", Utc::now().format("%Y-%m-%d %H:%M"))
+                            }),
+                            false,
+                            ThreadSurface::App,
+                        )
+                        .map_err(|err| AppControlError::internal(err.to_string()))?;
+                    self.persist_state()
+                        .map_err(|err| AppControlError::internal(err.to_string()))?;
+                    Ok(self.app_thread_summary(&repo.repo_id, &thread))
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            AppControlCommand::SendToThread {
+                device_id,
+                repo_id,
+                thread_id,
+                text,
+                reply,
+            } => {
+                let result = self
+                    .handle_app_send(&device_id, &repo_id, &thread_id, text)
+                    .await;
+                let _ = reply.send(result);
+            }
+            AppControlCommand::AbortRun {
+                device_id,
+                repo_id,
+                turn_id,
+                reply,
+            } => {
+                let result = async {
+                    let run = self
+                        .active_runs
+                        .get(&repo_id)
+                        .cloned()
+                        .ok_or_else(|| AppControlError::not_found("run not found"))?;
+                    match &run.route {
+                        RunRoute::App { device_id: owner } if owner == &device_id => {}
+                        _ => {
+                            return Err(AppControlError::conflict("run belongs to another device"));
+                        }
+                    }
+                    if run.turn_id != turn_id {
+                        return Err(AppControlError::conflict(
+                            "turn_id does not match the active run",
+                        ));
+                    }
+                    let thread = self
+                        .state
+                        .find_thread_for_surface(&repo_id, &run.thread_local_id, ThreadSurface::App)
+                        .cloned()
+                        .ok_or_else(|| AppControlError::not_found("thread not found"))?;
+                    self.ensure_runtime_for_repo(&repo_id, None, ThreadSurface::App)
+                        .await
+                        .map_err(|err| AppControlError::internal(err.to_string()))?
+                        .interrupt_turn(thread.codex_thread_id, run.turn_id)
+                        .await
+                        .map_err(|err| AppControlError::internal(err.to_string()))?;
+                    Ok(serde_json::json!({"status": "interrupt_requested"}))
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            AppControlCommand::RespondApproval {
+                device_id,
+                repo_id,
+                request_id,
+                decision,
+                reply,
+            } => {
+                let result = self
+                    .handle_app_approval_response(&device_id, &repo_id, &request_id, decision)
+                    .await;
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    async fn handle_app_send(
+        &mut self,
+        device_id: &str,
+        repo_id: &str,
+        thread_id: &str,
+        text: String,
+    ) -> std::result::Result<Value, AppControlError> {
+        if self.active_runs.contains_key(repo_id) {
+            return Err(AppControlError::conflict(
+                "this repo already has a running turn",
+            ));
+        }
+        let mut thread = self
+            .state
+            .find_thread_for_surface(repo_id, thread_id, ThreadSurface::App)
+            .cloned()
+            .ok_or_else(|| AppControlError::not_found(format!("thread not found: {thread_id}")))?;
+        if !thread.has_user_message {
+            let title = title_from_text(&text);
+            self.state
+                .update_thread_title(
+                    repo_id,
+                    &thread.local_thread_id,
+                    ThreadSurface::App,
+                    title.clone(),
+                )
+                .map_err(|err| AppControlError::internal(err.to_string()))?;
+            self.persist_state()
+                .map_err(|err| AppControlError::internal(err.to_string()))?;
+            thread.title = title;
+            thread.has_user_message = true;
+        }
+        let model = self.config.codex.model.clone();
+        let network_access = self.config.codex.network_access;
+        let response = self
+            .ensure_runtime_for_repo(repo_id, Some(&thread), ThreadSurface::App)
+            .await
+            .map_err(|err| AppControlError::internal(err.to_string()))?
+            .start_turn(thread.codex_thread_id.clone(), text, model, network_access)
+            .await
+            .map_err(|err| AppControlError::internal(err.to_string()))?;
+        self.active_file_changes.remove(repo_id);
+        self.active_runs.insert(
+            repo_id.to_string(),
+            ActiveRun {
+                surface: ThreadSurface::App,
+                thread_local_id: thread.local_thread_id.clone(),
+                turn_id: response.turn.id.clone(),
+                assistant_text: String::new(),
+                command_output_tail: String::new(),
+                diff_preview: String::new(),
+                route: RunRoute::App {
+                    device_id: device_id.to_string(),
+                },
+                pending_request: None,
+            },
+        );
+        Ok(serde_json::json!({
+            "repo_id": repo_id,
+            "thread_id": thread.local_thread_id,
+            "turn_id": response.turn.id,
+        }))
+    }
+
+    async fn handle_app_approval_response(
+        &mut self,
+        device_id: &str,
+        repo_id: &str,
+        request_id: &RpcId,
+        decision: AppApprovalDecision,
+    ) -> std::result::Result<Value, AppControlError> {
+        let run = self
+            .active_runs
+            .get(repo_id)
+            .cloned()
+            .ok_or_else(|| AppControlError::not_found("run not found"))?;
+        match &run.route {
+            RunRoute::App { device_id: owner } if owner == device_id => {}
+            _ => return Err(AppControlError::conflict("run belongs to another device")),
+        }
+        let pending = run
+            .pending_request
+            .clone()
+            .ok_or_else(|| AppControlError::not_found("approval not found"))?;
+        if pending_request_id(&pending) != request_id {
+            return Err(AppControlError::conflict(
+                "request_id does not match active approval",
+            ));
+        }
+        let runtime = self
+            .ensure_runtime_for_repo(repo_id, None, ThreadSurface::App)
+            .await
+            .map_err(|err| AppControlError::internal(err.to_string()))?;
+        let status = match pending {
+            RuntimePendingRequest::Command(pending) => {
+                let decision = match decision {
+                    AppApprovalDecision::Accept => CommandExecutionApprovalDecision::Accept,
+                    AppApprovalDecision::Decline => CommandExecutionApprovalDecision::Decline,
+                    AppApprovalDecision::Cancel => CommandExecutionApprovalDecision::Cancel,
+                };
+                runtime
+                    .respond_command_approval(pending.request_id, decision.clone())
+                    .await
+                    .map_err(|err| AppControlError::internal(err.to_string()))?;
+                match decision {
+                    CommandExecutionApprovalDecision::Accept => "approved",
+                    CommandExecutionApprovalDecision::Decline => "declined",
+                    CommandExecutionApprovalDecision::Cancel => "abort requested",
+                }
+            }
+            RuntimePendingRequest::File(pending) => {
+                let decision = match decision {
+                    AppApprovalDecision::Accept => FileChangeApprovalDecision::Accept,
+                    AppApprovalDecision::Decline => FileChangeApprovalDecision::Decline,
+                    AppApprovalDecision::Cancel => FileChangeApprovalDecision::Cancel,
+                };
+                runtime
+                    .respond_file_approval(pending.request_id, decision.clone())
+                    .await
+                    .map_err(|err| AppControlError::internal(err.to_string()))?;
+                match decision {
+                    FileChangeApprovalDecision::Accept => "approved",
+                    FileChangeApprovalDecision::Decline => "declined",
+                    FileChangeApprovalDecision::Cancel => "abort requested",
+                }
+            }
+        };
+        self.cleanup_pending_request(repo_id, Some(status))
+            .await
+            .map_err(|err| AppControlError::internal(err.to_string()))?;
+        Ok(serde_json::json!({ "status": status }))
+    }
+
+    fn app_thread_summary(&self, repo_id: &str, thread: &ThreadRecord) -> Value {
+        let active_run = self
+            .active_runs
+            .get(repo_id)
+            .filter(|run| {
+                run.thread_local_id == thread.local_thread_id && run.surface == ThreadSurface::App
+            })
+            .map(|run| {
+                serde_json::json!({
+                    "turn_id": run.turn_id,
+                    "assistant_text": run.assistant_text,
+                    "command_output_tail": run.command_output_tail,
+                    "diff_preview": run.diff_preview,
+                    "pending_request": run.pending_request.as_ref().map(app_pending_summary),
+                })
+            });
+        serde_json::json!({
+            "local_thread_id": thread.local_thread_id,
+            "codex_thread_id": thread.codex_thread_id,
+            "title": thread.title,
+            "status": format!("{:?}", thread.status).to_lowercase(),
+            "created_at": thread.created_at,
+            "last_used_at": thread.last_used_at,
+            "has_user_message": thread.has_user_message,
+            "active_run": active_run,
+        })
+    }
+
+    fn find_pending_request(&self, request_id: &RpcId) -> Option<(String, RuntimePendingRequest)> {
+        self.active_runs.iter().find_map(|(repo_id, run)| {
+            run.pending_request
+                .as_ref()
+                .filter(|pending| pending_request_id(pending) == request_id)
+                .cloned()
+                .map(|pending| (repo_id.clone(), pending))
+        })
+    }
+
+    async fn emit_app_event(&self, device_id: &str, method: &str, params: Value) {
+        if let Some(gateway) = &self.app_gateway {
+            if let Err(err) = gateway.send_event(device_id, method, &params).await {
+                warn!(
+                    "failed to push APP event {} to {}: {err}",
+                    method, device_id
+                );
+            }
+        }
     }
 
     fn persist_state(&self) -> Result<()> {
@@ -1824,16 +2423,6 @@ impl App {
         self.state.approved_telegram_peers = disk_state.approved_telegram_peers;
         self.state.pending_pairings = disk_state.pending_pairings;
         Ok(())
-    }
-
-    fn active_chat_id(&self) -> Result<i64> {
-        if let Some(progress) = &self.progress {
-            return Ok(progress.chat_id);
-        }
-        self.config
-            .telegram
-            .allowed_chat_id
-            .context("no active chat id available")
     }
 
     async fn handle_pairing_message(&mut self, message: &TelegramMessage) -> Result<()> {
@@ -2134,31 +2723,61 @@ fn status_label_from_state(active_turn_id: Option<&str>, force: bool) -> String 
     }
 }
 
-fn pending_request_id(value: &PendingRequest) -> &RpcId {
+fn pending_request_id(value: &RuntimePendingRequest) -> &RpcId {
     match value {
-        PendingRequest::CommandApproval { request_id, .. } => request_id,
-        PendingRequest::FileApproval { request_id, .. } => request_id,
+        RuntimePendingRequest::Command(pending) => &pending.request_id,
+        RuntimePendingRequest::File(pending) => &pending.request_id,
     }
 }
 
-fn pending_request_message_meta(value: &PendingRequest) -> Option<(i64, i64, &str)> {
+fn pending_request_message_meta(value: &RuntimePendingRequest) -> Option<(i64, i64, &str)> {
     match value {
-        PendingRequest::CommandApproval {
-            approval_chat_id,
-            approval_message_id,
-            approval_message_text,
-            ..
+        RuntimePendingRequest::Command(pending) => pending
+            .telegram_message
+            .as_ref()
+            .map(|message| (message.chat_id, message.message_id, message.text.as_str())),
+        RuntimePendingRequest::File(pending) => pending
+            .telegram_message
+            .as_ref()
+            .map(|message| (message.chat_id, message.message_id, message.text.as_str())),
+    }
+}
+
+fn pending_request_summary(value: &RuntimePendingRequest) -> String {
+    match value {
+        RuntimePendingRequest::Command(pending) => format!(
+            "command approval ({})",
+            pending.command.clone().unwrap_or_default()
+        ),
+        RuntimePendingRequest::File(pending) => {
+            format!("file approval ({})", pending.paths.join(", "))
         }
-        | PendingRequest::FileApproval {
-            approval_chat_id,
-            approval_message_id,
-            approval_message_text,
-            ..
-        } => Some((
-            *approval_chat_id,
-            *approval_message_id,
-            approval_message_text.as_str(),
-        )),
+    }
+}
+
+fn app_pending_summary(value: &RuntimePendingRequest) -> Value {
+    match value {
+        RuntimePendingRequest::Command(pending) => serde_json::json!({
+            "request_id": pending.request_id,
+            "kind": "command",
+            "thread_title": pending.thread_title,
+            "turn_id": pending.turn_id,
+            "item_id": pending.item_id,
+            "command": pending.command,
+            "cwd": pending.cwd,
+            "reason": pending.reason,
+        }),
+        RuntimePendingRequest::File(pending) => serde_json::json!({
+            "request_id": pending.request_id,
+            "kind": "file",
+            "thread_title": pending.thread_title,
+            "turn_id": pending.turn_id,
+            "item_id": pending.item_id,
+            "paths": pending.paths,
+            "reason": pending.reason,
+            "diff_preview": pending.diff_preview,
+            "preferred_decision": format!("{:?}", pending.preferred_decision).to_lowercase(),
+        }),
     }
 }
 
@@ -2282,7 +2901,7 @@ enum MessageAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ThreadStatusRecord;
+    use crate::state::{ThreadStatusRecord, ThreadSurface};
     use tempfile::tempdir;
 
     #[test]
@@ -2293,6 +2912,7 @@ mod tests {
             codex_thread_path: Some(PathBuf::from("/tmp/thread.jsonl")),
             repo_id: "repo-1".into(),
             title: "demo".into(),
+            surface: ThreadSurface::Telegram,
             status: ThreadStatusRecord::Active,
             created_at: Utc::now(),
             last_used_at: Utc::now(),

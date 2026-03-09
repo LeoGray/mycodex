@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::app::App;
+use crate::app::App as ServerApp;
+use crate::app_cli::{AppCommand, run_app_command};
 use crate::config::Config;
 use crate::onboard::OnboardOptions;
 use crate::pairing::{PairingCommand, run_pairing};
@@ -45,6 +46,12 @@ enum Command {
         #[command(subcommand)]
         command: PairingCommand,
     },
+    App {
+        #[arg(long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+        #[command(subcommand)]
+        command: AppCommand,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -54,13 +61,13 @@ pub async fn run() -> Result<()> {
     match cli.command {
         Command::Serve { config } => {
             let config = Config::load(&config)?;
-            let mut app = App::new(config).await?;
+            let mut app = ServerApp::new(config).await?;
             app.run().await
         }
         Command::Check { config } => {
             let config = Config::load(&config)?;
             config.validate()?;
-            App::check(config).await
+            ServerApp::check(config).await
         }
         Command::Onboard {
             config,
@@ -75,6 +82,7 @@ pub async fn run() -> Result<()> {
             .await
         }
         Command::Pairing { config, command } => run_pairing(config, command),
+        Command::App { config, command } => run_app_command(config, command),
     }
 }
 

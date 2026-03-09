@@ -1,4 +1,4 @@
-use crate::state::{ApprovalRule, PendingRequest, RepoRecord, ThreadRecord};
+use crate::state::{ApprovalRule, RepoRecord, ThreadRecord, ThreadSurface};
 
 pub const TELEGRAM_MESSAGE_LIMIT: usize = 3800;
 
@@ -47,7 +47,7 @@ pub fn render_status(
     active_thread: Option<&ThreadRecord>,
     runtime_repo_id: Option<&str>,
     active_turn_id: Option<&str>,
-    pending_request: Option<&PendingRequest>,
+    pending_summary: Option<&str>,
     approval_rule_count: usize,
 ) -> String {
     let repo_line = active_repo
@@ -72,18 +72,9 @@ pub fn render_status(
     let turn_line = active_turn_id
         .map(|turn| format!("turn: {}", short_id(turn)))
         .unwrap_or_else(|| "turn: none".to_string());
-    let pending_line = match pending_request {
-        Some(PendingRequest::CommandApproval { command, .. }) => {
-            format!(
-                "pending: command approval ({})",
-                command.clone().unwrap_or_default()
-            )
-        }
-        Some(PendingRequest::FileApproval { paths, .. }) => {
-            format!("pending: file approval ({})", paths.join(", "))
-        }
-        None => "pending: none".to_string(),
-    };
+    let pending_line = pending_summary
+        .map(|value| format!("pending: {value}"))
+        .unwrap_or_else(|| "pending: none".to_string());
     let approval_line = format!("approval rules: {approval_rule_count}");
 
     [
@@ -114,7 +105,7 @@ pub fn render_repo_list(repos: &[RepoRecord], active_repo_id: Option<&str>) -> S
             marker,
             repo.name,
             short_id(&repo.repo_id),
-            repo.threads.len()
+            repo.threads_for_surface(ThreadSurface::Telegram).len()
         ));
     }
     lines.join("\n")
@@ -129,7 +120,10 @@ pub fn render_repo_status(repo: &RepoRecord) -> String {
             "origin: {}",
             repo.origin_url.as_deref().unwrap_or("unknown")
         ),
-        format!("threads: {}", repo.threads.len()),
+        format!(
+            "threads: {}",
+            repo.threads_for_surface(ThreadSurface::Telegram).len()
+        ),
         format!("active thread: {}", short_id(active)),
     ]
     .join("\n")
@@ -153,12 +147,13 @@ pub fn render_approval_rules(repo: &RepoRecord, rules: &[&ApprovalRule]) -> Stri
 }
 
 pub fn render_thread_list(repo: &RepoRecord) -> String {
-    if repo.threads.is_empty() {
+    let threads = repo.threads_for_surface(ThreadSurface::Telegram);
+    if threads.is_empty() {
         return format!("Repo {} has no threads yet.", repo.name);
     }
 
     let mut lines = vec![format!("Threads for {}", repo.name), String::new()];
-    for (index, thread) in repo.threads.iter().enumerate() {
+    for (index, thread) in threads.into_iter().enumerate() {
         let marker =
             if repo.active_thread_local_id.as_deref() == Some(thread.local_thread_id.as_str()) {
                 "*"

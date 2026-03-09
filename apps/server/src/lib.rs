@@ -1,4 +1,7 @@
 pub mod app;
+pub mod app_auth;
+pub mod app_cli;
+pub mod app_gateway;
 pub mod cli;
 pub mod codex;
 pub mod commands;

@@ -1,0 +1,11 @@
+[package]
+name = "mycodex-desktop-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri shell for the MyCodex desktop APP surface"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

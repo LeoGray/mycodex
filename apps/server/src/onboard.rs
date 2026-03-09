@@ -7,8 +7,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::config::{
-    CodexConfig, Config, GitConfig, StateConfig, TelegramAccessMode, TelegramConfig, UiConfig,
-    WorkspaceConfig,
+    AppConfig, CodexConfig, Config, GitConfig, StateConfig, TelegramAccessMode, TelegramConfig,
+    UiConfig, WorkspaceConfig,
 };
 use crate::platform;
 use crate::telegram::api::{TelegramClient, default_bot_commands};
@@ -96,6 +96,29 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
         allowed_chat_id: None,
         poll_timeout_seconds: config.telegram.poll_timeout_seconds,
     };
+    let enable_app_gateway = confirm("Enable remote APP gateway?", config.app.enabled)?;
+    config.app = if enable_app_gateway {
+        let bind_addr = prompt_with_default("APP bind address", &config.app.bind_addr, false)?;
+        let public_base_url = prompt_optional(
+            "APP public base URL (optional)",
+            (!config.app.public_base_url.is_empty()).then_some(config.app.public_base_url.as_str()),
+            false,
+        )?
+        .unwrap_or_default();
+        AppConfig {
+            enabled: true,
+            bind_addr,
+            public_base_url,
+            pairing_code_ttl_sec: config.app.pairing_code_ttl_sec,
+        }
+    } else {
+        AppConfig {
+            enabled: false,
+            bind_addr: config.app.bind_addr,
+            public_base_url: config.app.public_base_url,
+            pairing_code_ttl_sec: config.app.pairing_code_ttl_sec,
+        }
+    };
 
     write_config(&options.config_path, &config)?;
     write_env_file(&options.env_path, &env_map)?;
@@ -175,6 +198,7 @@ fn default_config() -> Result<Config> {
             allowed_chat_id: None,
             poll_timeout_seconds: 30,
         },
+        app: AppConfig::default(),
         codex: CodexConfig {
             bin: "codex".into(),
             model: None,

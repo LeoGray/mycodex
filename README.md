@@ -45,6 +45,14 @@ cd mycodex
 - optionally store `OPENAI_API_KEY`
 - optionally enable the installed service
 
+## Repository Layout
+
+- `apps/server`: Rust daemon, Telegram adapter, APP gateway, and CLI
+- `apps/desktop`: Tauri + React desktop client shell
+- `config`: example configuration
+- `deploy`: service definitions
+- `scripts`: install and packaging helpers
+
 ## Command Menu
 
 Basic:
@@ -134,6 +142,14 @@ The official release workflow publishes one Linux artifact: `mycodex-x86_64-unkn
 ```bash
 cargo build --release
 cargo test
+```
+
+Desktop shell:
+
+```bash
+cd apps/desktop
+npm install
+npm run tauri:dev
 ```
 
 For manual Linux service setup, use [deploy/systemd/mycodex.service](./deploy/systemd/mycodex.service) as a starting point.

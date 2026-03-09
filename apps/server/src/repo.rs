@@ -204,6 +204,7 @@ mod tests {
                 allowed_chat_id: Some(1),
                 poll_timeout_seconds: 30,
             },
+            app: crate::config::AppConfig::default(),
             codex: CodexConfig {
                 bin: "codex".into(),
                 model: None,
