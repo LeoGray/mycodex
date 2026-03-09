@@ -2,16 +2,18 @@
 
 **Language:** English | [简体中文](./README.zh-CN.md)
 
-MyCodex is a Telegram-driven remote coding gateway for `codex`.
-It lets you run Codex against multiple Git repositories inside one workspace, with isolated repo state and multiple threads per repo.
+MyCodex is a remote coding gateway for `codex`.
+It lets you run Codex against multiple Git repositories inside one workspace, with isolated repo state, multiple threads per repo, and optional control surfaces for Telegram and the desktop APP.
 
 Core points:
 
-- Telegram is the control plane
+- Telegram remains a first-class control surface
+- The desktop APP can pair over HTTP and WebSocket when enabled
 - One workspace can hold many first-level repos
 - Each repo has its own Codex runtime boundary
 - Each repo can have multiple threads
-- Command and patch approvals are handled from Telegram
+- Telegram threads and APP threads are isolated from each other
+- Command and patch approvals route back to the surface that started the run
 
 ## Quick Start
 
@@ -43,6 +45,7 @@ cd mycodex
 - validate the Telegram bot token
 - let you choose a workspace path
 - optionally store `OPENAI_API_KEY`
+- optionally enable the remote APP gateway
 - optionally enable the installed service
 
 ## Repository Layout
@@ -83,17 +86,27 @@ Plain text messages are always sent to the active thread of the active repo.
 - `workspace`: a directory that contains first-level repos
 - `repo`: the runtime isolation boundary
 - `thread`: a Codex conversation inside one repo
+- `surface`: the interaction entry point, either `telegram` or `app`
 
 Switching repos does not reuse another repo's runtime context.
+Telegram threads and APP threads do not appear in each other's thread lists.
 
-Default access mode is `pairing`.
-First-time flow:
+Telegram access mode is `pairing` by default.
+First-time Telegram flow:
 
 1. Install MyCodex
 2. Run `/usr/local/bin/mycodex onboard`
 3. Send a message to the bot
 4. Get a pairing code
 5. Approve it on the server with `/usr/local/bin/mycodex pairing approve <CODE>`
+
+Desktop APP flow:
+
+1. Enable the APP gateway during `onboard`, or set `app.enabled = true`
+2. Start the daemon
+3. Open the desktop APP and request a pairing code
+4. Approve it on the server with `/usr/local/bin/mycodex app pairing approve <CODE>`
+5. Connect the APP with the issued bearer token
 
 ## Config
 
@@ -104,6 +117,9 @@ Most important keys:
 - `workspace.root`
 - `telegram.bot_token`
 - `telegram.access_mode`
+- `app.enabled`
+- `app.bind_addr`
+- `app.public_base_url`
 - `codex.bin`
 - `state.dir`
 
@@ -151,5 +167,11 @@ cd apps/desktop
 npm install
 npm run tauri:dev
 ```
+
+The desktop shell talks to the daemon over:
+
+- `POST /api/app/pairings/request`
+- `GET /api/app/pairings/{pairing_id}`
+- authenticated WebSocket `/ws?token=...`
 
 For manual Linux service setup, use [deploy/systemd/mycodex.service](./deploy/systemd/mycodex.service) as a starting point.
