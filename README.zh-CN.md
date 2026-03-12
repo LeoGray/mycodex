@@ -2,27 +2,32 @@
 
 **语言:** [English](./README.md) | 简体中文
 
-MyCodex 是一个面向 `codex` 的远程编码网关。
-它把多个 Git 仓库放进同一个 workspace 里管理，同时保证 repo 之间的 Codex 运行时隔离，支持每个 repo 下的多线程会话，并提供 Telegram 和可选桌面 APP 两种控制入口。
+把 Codex 放在你自己控制的服务器上，然后从 Mac、Telegram 和手机继续同一个任务。
 
-核心点：
+我做 MyCodex，是因为我想把 Codex 固定在自己的机器或 VPS 上跑，但自己可以在不同设备之间来回切换。一个 workspace 里可以放多个一级 Git 仓库，每个 repo 都保持隔离，也都可以有多个 thread。
 
-- Telegram 仍然是一级控制入口
-- 开启后，桌面 APP 可以通过 HTTP 和 WebSocket 配对接入
-- 一个 workspace 可以放多个一级仓库
-- 每个 repo 都有独立的 Codex runtime 边界
-- 每个 repo 可以有多个 thread
-- Telegram thread 和 APP thread 相互隔离
-- 命令审批和补丁审批会回到发起该 run 的入口面
+macOS app 还在开发中，但方向很明确：人在电脑前时就在 Mac 上干活，离开工位之后，继续用 Telegram 或另一个已配对的客户端把同一个任务接着做下去。
+
+<img src="./docs/media/telegram-flow.gif" alt="Telegram workflow demo" width="360" />
+
+Telegram 这一侧现在已经是这样工作的：发起一个 thread，在聊天里审批敏感命令，然后在同一个地方收到执行结果。
+
+## 现在它能做什么
+
+- 一个 workspace 里可以放多个 repo，但不会把它们的 Codex 状态混在一起
+- 每个 repo 可以开多个 thread
+- Telegram thread 和 app thread 分开管理
+- 命令审批和补丁审批会回到发起它们的入口
+- 先在 Mac 上干活，之后再拿手机接着做，会顺很多
 
 ## 快速开始
 
-先准备好：
+先准备这些：
 
 - 可用的 `codex` CLI
 - Codex 登录态或 `OPENAI_API_KEY`
 - `git`
-- Telegram Bot Token
+- 如果要启用 Telegram，再准备一个 Telegram Bot Token
 
 官方一键安装，适用于 x86_64 Linux：
 
@@ -40,18 +45,37 @@ cd mycodex
 /usr/local/bin/mycodex onboard
 ```
 
-`onboard` 会完成：
+`onboard` 会做这些事：
 
-- 校验 Telegram bot token
-- 选择 workspace 路径
+- 可选校验 Telegram bot token
+- 让你选择 workspace 路径
 - 可选写入 `OPENAI_API_KEY`
-- 可选开启远程 APP gateway
-- 可选启用已安装的服务
+- 可选开启远程 app gateway
+- 可选启用已经安装的服务
+
+## macOS App 形态
+
+- 仅客户端模式：只启动 app 客户端，连接远程的 MyCodex server
+- 仅服务器模式：只在 Mac 上启动 MyCodex server，供其他设备配对接入
+- 同时启动模式：同一台 Mac 同时启动 server 和 client，本机写代码，离开工位后继续用手机接管
+
+几条 macOS 相关说明：
+
+- 本地 Host 会把生成的 `config.toml`、state、workspace 和日志都放进 app 自己的数据目录，不走系统安装版默认路径
+- 本地 Host 可以完全关闭 Telegram，只保留 app gateway 和 Codex 主链路
+- 本地 Host 的网络暴露是显式开关：`Local only` 绑定 `127.0.0.1`，`Allow LAN devices` 绑定 `0.0.0.0`，并展示给手机配对用的局域网地址
+
+## 我自己会怎么用
+
+1. 在 Mac 上以“同时启动模式”运行 MyCodex。
+2. 在桌面 app 里，针对 workspace 里的某个 repo 本地工作。
+3. 离开 Mac 之后，通过 Telegram 或另一个已配对的 app 在手机上继续同一个任务。
+4. repo 隔离、thread 状态和审批链路都会继续绑定在发起它们的入口面上。
 
 ## 仓库结构
 
-- `apps/server`：Rust daemon、Telegram 适配层、APP gateway 和 CLI
-- `apps/desktop`：Tauri + React 桌面客户端骨架
+- `apps/server`：Rust daemon、Telegram 适配层、app gateway 和 CLI
+- `apps/desktop`：Tauri + React 客户端骨架，覆盖桌面端、Android 和 iOS
 - `config`：示例配置
 - `deploy`：服务定义
 - `scripts`：安装和打包脚本
@@ -81,15 +105,15 @@ Thread 命令：
 
 普通文本消息会始终发到当前 active repo 的当前 active thread。
 
-## 工作模型
+## 基本模型
 
 - `workspace`：装一级仓库的目录
 - `repo`：运行时隔离边界
 - `thread`：某个 repo 内的一次 Codex 会话
-- `surface`：交互入口，当前有 `telegram` 和 `app`
+- `surface`：你正在使用的入口，当前有 `telegram` 和 `app`
 
 切换 repo 不会继承另一个 repo 的运行时上下文。
-Telegram thread 和 APP thread 不会出现在对方的 thread 列表里。
+Telegram thread 和 app thread 不会出现在对方的 thread 列表里。
 
 Telegram 默认访问模式是 `pairing`。
 第一次通过 Telegram 使用的流程：
@@ -100,13 +124,19 @@ Telegram 默认访问模式是 `pairing`。
 4. 收到 pairing code
 5. 在服务器上执行 `/usr/local/bin/mycodex pairing approve <CODE>`
 
-桌面 APP 使用流程：
+App 使用流程：
 
-1. 在 `onboard` 时开启 APP gateway，或者手动设置 `app.enabled = true`
+1. 在 `onboard` 时开启 app gateway，或者手动设置 `app.enabled = true`
 2. 启动 daemon
-3. 打开桌面 APP 并申请 pairing code
+3. 在桌面端或移动端打开 app 并申请 pairing code
 4. 在服务器上执行 `/usr/local/bin/mycodex app pairing approve <CODE>`
-5. 用签发下来的 bearer token 连接 APP
+5. 用签发下来的 bearer token 连接 app
+
+桌面 app 里的几个主要页面：
+
+- `Workbench`：主工作区，负责 workspace、repo、thread 和 composer 流程
+- `Settings`：承载 server URL、token、pairing、设备标签和诊断信息
+- `Host`：桌面专属页面，承载本地 server 生命周期、LAN 模式、配置路径和日志
 
 ## 配置
 
@@ -136,7 +166,7 @@ Telegram 默认访问模式是 `pairing`。
   - 服务：`$HOME/Library/LaunchAgents/com.leogray.mycodex.plist`
   - 状态目录：`$HOME/.local/state/mycodex`
 
-## 安装与发布说明
+## 打包与发布
 
 - [public/install.sh](./public/install.sh) 是官方预构建安装器，默认只发 `x86_64-unknown-linux-musl`
 - [scripts/install.sh](./scripts/install.sh) 从本地源码构建，支持 Linux 和 macOS
@@ -160,13 +190,29 @@ cargo build --release
 cargo test
 ```
 
-桌面端：
+客户端：
 
 ```bash
 cd apps/desktop
 npm install
 npm run tauri:dev
 ```
+
+移动端：
+
+```bash
+cd apps/desktop
+npm run tauri:android:dev
+npm run tauri:android:build
+npm run tauri:ios:dev
+npm run tauri:ios:build
+```
+
+说明：
+
+- Android 和 iOS 的宿主工程已经落在 `apps/desktop/src-tauri/gen/android` 和 `apps/desktop/src-tauri/gen/apple`
+- Android 构建默认允许连到局域网里的 HTTP / WebSocket daemon，便于本机和真机联调
+- iOS 不提交签名材料；每个开发者在本地用自己的 Apple 账号签名和打包
 
 桌面端会通过下面这些接口连接 daemon：
 

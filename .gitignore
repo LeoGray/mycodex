@@ -4,6 +4,21 @@
 /apps/desktop/dist
 /apps/desktop/src-tauri/target
 
+# Local debug captures
+/.playwright-cli/
+
+# Generated mobile host projects
+/apps/desktop/src-tauri/gen/android/
+/apps/desktop/src-tauri/gen/apple/
+/apps/desktop/src-tauri/gen/schemas/android-schema.json
+/apps/desktop/src-tauri/gen/schemas/mobile-schema.json
+
+# Internal docs and source screenshots
+/docs/unified-workbench-v1.md
+/docs/media/1.png
+/docs/media/2.png
+/docs/media/3.png
+
 # Local environment files
 .env
 .env.*
