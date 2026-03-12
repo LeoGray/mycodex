@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    tauri::Builder::default()
-        .run(tauri::generate_context!())
-        .expect("failed to run MyCodex desktop shell");
+    if let Some(exit_code) = mycodex_app_lib::try_run_embedded_host() {
+        std::process::exit(exit_code);
+    }
+    mycodex_app_lib::run();
 }

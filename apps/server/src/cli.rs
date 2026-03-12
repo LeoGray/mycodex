@@ -55,9 +55,17 @@ enum Command {
 }
 
 pub async fn run() -> Result<()> {
+    run_with_args(std::env::args_os()).await
+}
+
+pub async fn run_with_args<I, T>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
     init_tracing();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     match cli.command {
         Command::Serve { config } => {
             let config = Config::load(&config)?;

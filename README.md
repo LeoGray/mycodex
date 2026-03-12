@@ -132,6 +132,21 @@ App flow:
 4. Approve it on the server with `/usr/local/bin/mycodex app pairing approve <CODE>`
 5. Connect the app with the issued bearer token
 
+Pure server token management:
+
+- Pairing is still the default and recommended way to onboard an app device.
+- If you run MyCodex as a pure Linux or macOS daemon, you can also issue or rotate an APP token directly from the server CLI:
+
+```bash
+/usr/local/bin/mycodex app devices create --label "MacBook Pro"
+/usr/local/bin/mycodex app devices rotate <DEVICE_ID>
+/usr/local/bin/mycodex app devices revoke <DEVICE_ID>
+/usr/local/bin/mycodex app devices list
+```
+
+- `create` and `rotate` print a new bearer token once. The server stores only its hash, so an existing token cannot be shown again later.
+- Use `rotate` or `revoke` when you need to invalidate a current token.
+
 Desktop app tabs:
 
 - `Workbench`: primary workspace, repo, thread, and composer flow

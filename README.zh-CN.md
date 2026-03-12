@@ -132,6 +132,21 @@ App 使用流程：
 4. 在服务器上执行 `/usr/local/bin/mycodex app pairing approve <CODE>`
 5. 用签发下来的 bearer token 连接 app
 
+纯 server 形态的 token 管理：
+
+- pairing 仍然是默认推荐流程。
+- 如果你是在 Linux 或 macOS 上以纯 daemon 形态运行 MyCodex，也可以直接在 server 上手动签发或轮换 APP token：
+
+```bash
+/usr/local/bin/mycodex app devices create --label "MacBook Pro"
+/usr/local/bin/mycodex app devices rotate <DEVICE_ID>
+/usr/local/bin/mycodex app devices revoke <DEVICE_ID>
+/usr/local/bin/mycodex app devices list
+```
+
+- `create` 和 `rotate` 只会在当次输出一次新的 bearer token。server 只保存它的 hash，所以旧 token 之后无法再次展示。
+- 如果你要让当前 token 失效，用 `rotate` 或 `revoke`。
+
 桌面 app 里的几个主要页面：
 
 - `Workbench`：主工作区，负责 workspace、repo、thread 和 composer 流程

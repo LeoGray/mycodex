@@ -31,7 +31,7 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
     println!("MyCodex onboarding");
     println!();
 
-    let bot_token = prompt_required(
+    let bot_token = prompt_optional(
         "Telegram bot token",
         if config.telegram.bot_token.trim().is_empty() {
             None
@@ -39,19 +39,24 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
             Some(config.telegram.bot_token.as_str())
         },
         true,
-    )?;
-    let telegram = TelegramClient::new(&bot_token);
-    let me = telegram
-        .get_me()
-        .await
-        .context("failed to validate Telegram bot token via getMe")?;
-    println!(
-        "Connected to Telegram bot: {}",
-        me.username.unwrap_or(me.first_name)
-    );
-    match telegram.set_my_commands(&default_bot_commands()).await {
-        Ok(()) => println!("Registered Telegram bot commands."),
-        Err(err) => eprintln!("Warning: failed to register Telegram bot commands: {err}"),
+    )?
+    .unwrap_or_default();
+    if bot_token.trim().is_empty() {
+        println!("Telegram disabled. APP clients can still connect if the APP gateway is enabled.");
+    } else {
+        let telegram = TelegramClient::new(&bot_token);
+        let me = telegram
+            .get_me()
+            .await
+            .context("failed to validate Telegram bot token via getMe")?;
+        println!(
+            "Connected to Telegram bot: {}",
+            me.username.unwrap_or(me.first_name)
+        );
+        match telegram.set_my_commands(&default_bot_commands()).await {
+            Ok(()) => println!("Registered Telegram bot commands."),
+            Err(err) => eprintln!("Warning: failed to register Telegram bot commands: {err}"),
+        }
     }
 
     let default_workspace = config.workspace.root.clone();
@@ -178,9 +183,15 @@ pub async fn run(options: OnboardOptions) -> Result<()> {
     println!();
     println!("Onboarding complete.");
     println!("Next steps:");
-    println!("1. Send a message to your Telegram bot.");
-    println!("2. Run `mycodex pairing list` on the server.");
-    println!("3. Run `mycodex pairing approve <CODE>` to approve yourself.");
+    if config.telegram.is_enabled() {
+        println!("1. Send a message to your Telegram bot.");
+        println!("2. Run `mycodex pairing list` on the server.");
+        println!("3. Run `mycodex pairing approve <CODE>` to approve yourself.");
+    } else {
+        println!("1. Start the server with `mycodex serve`.");
+        println!("2. Connect a mobile or desktop APP client to the APP gateway.");
+        println!("3. Use APP pairing to approve the device and begin working.");
+    }
     Ok(())
 }
 
@@ -275,15 +286,6 @@ fn run_self_check(config_path: &Path, env_map: &HashMap<String, String>) -> Resu
         bail!("`mycodex check` failed; update the configuration and retry onboarding");
     }
     Ok(())
-}
-
-fn prompt_required(label: &str, default: Option<&str>, secret: bool) -> Result<String> {
-    loop {
-        let value = prompt(label, default, secret)?;
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
 }
 
 fn prompt_optional(label: &str, default: Option<&str>, secret: bool) -> Result<Option<String>> {

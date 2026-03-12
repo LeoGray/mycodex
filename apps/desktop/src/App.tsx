@@ -1,22 +1,35 @@
 import { useEffect, useRef, useState } from "react";
 
+import { HostView } from "./components/HostView";
+import { SettingsView } from "./components/SettingsView";
+import { WorkbenchView } from "./components/WorkbenchView";
 import { GatewayRpcClient, pollPairing, requestPairing } from "./lib/gateway";
+import {
+  getHostStatus,
+  issueLocalHostConnection,
+  restartHost,
+  startHost,
+  stopHost,
+  updateHostConfig,
+} from "./lib/host";
 import {
   selectedThreadForRepo,
   useSessionStore,
   withPendingRequest,
 } from "./store/session";
+import type { AppMode, ConnectionStatus, RuntimeLog } from "./store/session";
+import type { HostConfigUpdate, HostStatusSnapshot } from "./lib/host";
 import type {
   AppPendingRequest,
-  AppRepoSummary,
+  AppThreadSummary,
   GatewayNotification,
   PairingPollResponse,
   RunApprovalRequiredEvent,
 } from "./types/gateway";
 
-function humanConnectionLabel(
-  status: ReturnType<typeof useSessionStore.getState>["connectionStatus"],
-): string {
+const MOBILE_BREAKPOINT = 860;
+
+function humanConnectionLabel(status: ConnectionStatus): string {
   switch (status) {
     case "pairing":
       return "Pairing pending";
@@ -31,26 +44,19 @@ function humanConnectionLabel(
   }
 }
 
-function formatTimestamp(value: string | null | undefined): string {
-  if (!value) {
-    return "n/a";
-  }
-
-  const timestamp = new Date(value);
-  if (Number.isNaN(timestamp.getTime())) {
-    return value;
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(timestamp);
-}
-
 function shortId(value: string | null | undefined): string {
   return value ? value.slice(0, 8) : "n/a";
+}
+
+function modeLabel(mode: AppMode): string {
+  switch (mode) {
+    case "local_host":
+      return "Local Host";
+    case "local_host_client":
+      return "Local Host + Client";
+    default:
+      return "Remote Client";
+  }
 }
 
 function pendingRequestFromEvent(event: RunApprovalRequiredEvent): AppPendingRequest {
@@ -80,36 +86,61 @@ function pendingRequestFromEvent(event: RunApprovalRequiredEvent): AppPendingReq
   };
 }
 
-function describeRepo(repo: AppRepoSummary): string {
-  return repo.app_thread_count === 1
-    ? "1 APP thread"
-    : `${repo.app_thread_count} APP threads`;
-}
-
-function describePendingRequest(pendingRequest: AppPendingRequest): string {
-  if (pendingRequest.kind === "command") {
-    return pendingRequest.command || "Command approval";
-  }
-  return pendingRequest.paths.join(", ") || "File approval";
-}
-
 function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error ? error.message : fallback;
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message;
+  }
+  return fallback;
+}
+
+function hostLogsFromSnapshot(snapshot: HostStatusSnapshot): RuntimeLog[] {
+  return snapshot.recentLogs.map((entry) => ({
+    id: entry.id,
+    level: entry.level === "error" ? "error" : "info",
+    message: `[${entry.source}] ${entry.message}`,
+    createdAt: entry.createdAt,
+  }));
+}
+
+function hostConfigToUpdate(config: {
+  networkMode: "local_only" | "lan";
+  port: number;
+  workspaceRoot: string;
+  stateDir: string;
+  codexBin: string;
+  binaryPath: string;
+  workingDirectory: string;
+}): HostConfigUpdate {
+  return {
+    networkMode: config.networkMode,
+    port: config.port,
+    workspaceRoot: config.workspaceRoot,
+    stateDir: config.stateDir,
+    codexBin: config.codexBin,
+    binaryPath: config.binaryPath || null,
+    workingDirectory: config.workingDirectory || null,
+  };
 }
 
 export default function App() {
   const {
-    serverUrl,
-    deviceLabel,
-    bearerToken,
-    connectionStatus,
-    lastError,
-    pairingSession,
-    repos,
-    threadsByRepo,
-    selectedRepoId,
-    selectedThreadIdByRepo,
-    runtimeLog,
+    mode,
+    host,
+    remote,
+    workbench,
+    setMode,
+    setActivePage,
     setServerUrl,
     setDeviceLabel,
     setBearerToken,
@@ -124,20 +155,74 @@ export default function App() {
     updateThreadRun,
     clearRuntimeState,
     pushRuntimeLog,
+    setHostRuntimeStatus,
+    setHostLastError,
+    setHostConfig,
+    replaceHostLogs,
   } = useSessionStore();
+
+  const { selectedMode, activePage } = mode;
+  const { runtimeStatus: hostRuntimeStatus, lastError: hostLastError, config: hostConfig } = host;
+  const { serverUrl, deviceLabel, bearerToken, connectionStatus, lastError, pairingSession } =
+    remote;
+  const { repos, threadsByRepo, selectedRepoId, selectedThreadIdByRepo, runtimeLog } =
+    workbench;
 
   const [messageInput, setMessageInput] = useState("");
   const [threadTitleInput, setThreadTitleInput] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [isCompactLayout, setIsCompactLayout] = useState(false);
+  const [hostDraft, setHostDraft] = useState({
+    networkMode: hostConfig.networkMode,
+    port: hostConfig.port,
+    workspaceRoot: hostConfig.workspaceRoot,
+    stateDir: hostConfig.stateDir,
+    codexBin: hostConfig.codexBin,
+    binaryPath: hostConfig.binaryPath,
+    workingDirectory: hostConfig.workingDirectory,
+  });
   const clientRef = useRef<GatewayRpcClient | null>(null);
+  const modeBootstrapRef = useRef<AppMode | null>(null);
+  const localHostControlsAvailable =
+    typeof window !== "undefined" &&
+    "__TAURI_INTERNALS__" in window &&
+    !/Android|iPhone|iPad|iPod/i.test(window.navigator.userAgent);
 
   const selectedRepo = repos.find((repo) => repo.repo_id === selectedRepoId) ?? null;
   const repoThreads = selectedRepoId ? threadsByRepo[selectedRepoId] ?? [] : [];
-  const selectedThread = selectedThreadForRepo(
-    selectedRepoId,
-    threadsByRepo,
-    selectedThreadIdByRepo,
-  );
+  const selectedThread = selectedThreadForRepo(selectedRepoId, workbench);
+
+  useEffect(() => {
+    setHostDraft({
+      networkMode: hostConfig.networkMode,
+      port: hostConfig.port,
+      workspaceRoot: hostConfig.workspaceRoot,
+      stateDir: hostConfig.stateDir,
+      codexBin: hostConfig.codexBin,
+      binaryPath: hostConfig.binaryPath,
+      workingDirectory: hostConfig.workingDirectory,
+    });
+  }, [
+    hostConfig.binaryPath,
+    hostConfig.codexBin,
+    hostConfig.networkMode,
+    hostConfig.port,
+    hostConfig.stateDir,
+    hostConfig.workingDirectory,
+    hostConfig.workspaceRoot,
+  ]);
+
+  useEffect(() => {
+    const updateLayout = () => {
+      setIsCompactLayout(window.innerWidth <= MOBILE_BREAKPOINT);
+    };
+
+    updateLayout();
+    window.addEventListener("resize", updateLayout);
+    return () => {
+      window.removeEventListener("resize", updateLayout);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -199,6 +284,47 @@ export default function App() {
     });
   }, [connectionStatus, selectedRepoId]);
 
+  useEffect(() => {
+    if (!localHostControlsAvailable && selectedMode !== "remote_client") {
+      setMode("remote_client");
+      setActivePage("workbench");
+      setLastError("Local Host modes are only available inside the desktop app shell.");
+      return;
+    }
+
+    if (modeBootstrapRef.current === selectedMode) {
+      return;
+    }
+
+    void bootstrapMode(selectedMode);
+  }, [
+    localHostControlsAvailable,
+    selectedMode,
+    setActivePage,
+    setLastError,
+    setMode,
+  ]);
+
+  function syncHostSnapshot(snapshot: HostStatusSnapshot) {
+    setHostRuntimeStatus(snapshot.status);
+    setHostLastError(snapshot.lastError);
+    setHostConfig({
+      networkMode: snapshot.config.networkMode,
+      port: snapshot.config.port,
+      bindAddress: snapshot.config.bindAddress,
+      lanAddress: snapshot.config.lanUrl,
+      workspaceRoot: snapshot.config.workspaceRoot,
+      stateDir: snapshot.config.stateDir,
+      configPath: snapshot.config.configPath,
+      logPath: snapshot.config.logPath,
+      codexBin: snapshot.config.codexBin,
+      binaryPath: snapshot.config.binaryPath ?? "",
+      workingDirectory: snapshot.config.workingDirectory ?? "",
+      telegramEnabled: snapshot.config.telegramEnabled,
+    });
+    replaceHostLogs(hostLogsFromSnapshot(snapshot));
+  }
+
   function applyPairingPoll(response: PairingPollResponse) {
     setPairingSession({
       pairingId: response.pairing_id,
@@ -250,7 +376,7 @@ export default function App() {
   }
 
   async function ensureThreadLoaded(repoId: string, threadId: string) {
-    const threads = useSessionStore.getState().threadsByRepo[repoId] ?? [];
+    const threads = useSessionStore.getState().workbench.threadsByRepo[repoId] ?? [];
     if (threads.some((thread) => thread.local_thread_id === threadId)) {
       return;
     }
@@ -259,6 +385,13 @@ export default function App() {
     } catch (error) {
       pushRuntimeLog("error", errorMessage(error, "Failed to refresh threads"));
     }
+  }
+
+  function threadLabel(repoId: string, threadId: string): string {
+    const thread = useSessionStore
+      .getState()
+      .workbench.threadsByRepo[repoId]?.find((item) => item.local_thread_id === threadId);
+    return thread?.title ?? `thread ${shortId(threadId)}`;
   }
 
   function handleGatewayNotification(notification: GatewayNotification) {
@@ -365,7 +498,7 @@ export default function App() {
     setRepos(response.repos);
 
     const targetRepoId =
-      useSessionStore.getState().selectedRepoId ?? response.repos[0]?.repo_id ?? null;
+      useSessionStore.getState().workbench.selectedRepoId ?? response.repos[0]?.repo_id ?? null;
     if (targetRepoId) {
       await refreshThreads(targetRepoId, client);
     }
@@ -412,8 +545,11 @@ export default function App() {
     }
   }
 
-  async function connectGateway() {
-    if (!serverUrl.trim() || !bearerToken.trim()) {
+  async function connectGatewayWithCredentials(
+    targetServerUrl: string,
+    targetBearerToken: string,
+  ) {
+    if (!targetServerUrl.trim() || !targetBearerToken.trim()) {
       setLastError("Daemon URL and bearer token are required.");
       setConnectionStatus("error");
       return;
@@ -423,7 +559,7 @@ export default function App() {
     clientRef.current?.disconnect();
     clearRuntimeState();
 
-    const client = new GatewayRpcClient(serverUrl, bearerToken);
+    const client = new GatewayRpcClient(targetServerUrl, targetBearerToken);
     client.onNotification(handleGatewayNotification);
     client.onDisconnect((message) => {
       clientRef.current = null;
@@ -453,6 +589,10 @@ export default function App() {
     }
   }
 
+  async function connectGateway() {
+    await connectGatewayWithCredentials(serverUrl, bearerToken);
+  }
+
   function disconnectGateway() {
     clientRef.current?.disconnect();
     clientRef.current = null;
@@ -460,6 +600,44 @@ export default function App() {
     setLastError(null);
     clearRuntimeState();
     pushRuntimeLog("info", "Disconnected from APP gateway.");
+  }
+
+  async function bootstrapMode(nextMode: AppMode) {
+    if (nextMode === "remote_client") {
+      modeBootstrapRef.current = nextMode;
+      return;
+    }
+
+    setBusyAction("mode-bootstrap");
+    try {
+      const desiredConfig = hostConfigToUpdate(useSessionStore.getState().host.config);
+      const currentHostStatus = await updateHostConfig(desiredConfig);
+      syncHostSnapshot(currentHostStatus);
+
+      const hostSnapshot =
+        currentHostStatus.status === "running"
+          ? currentHostStatus
+          : await startHost(desiredConfig);
+      syncHostSnapshot(hostSnapshot);
+
+      if (nextMode === "local_host_client") {
+        await connectToLocalHostClient();
+        setActivePage("workbench");
+      } else {
+        disconnectGateway();
+        setActivePage("host");
+      }
+
+      modeBootstrapRef.current = nextMode;
+    } catch (error) {
+      const message = errorMessage(error, "Failed to prepare local host mode");
+      setLastError(message);
+      setConnectionStatus("error");
+      pushRuntimeLog("error", `Local mode bootstrap failed: ${message}`);
+      modeBootstrapRef.current = null;
+    } finally {
+      setBusyAction(null);
+    }
   }
 
   async function handleRepoSelect(repoId: string) {
@@ -599,194 +777,222 @@ export default function App() {
     }
   }
 
-  function threadLabel(repoId: string, threadId: string): string {
-    const thread = useSessionStore
-      .getState()
-      .threadsByRepo[repoId]?.find((item) => item.local_thread_id === threadId);
-    return thread?.title ?? `thread ${shortId(threadId)}`;
+  function hostDraftToUpdate(): HostConfigUpdate {
+    return hostConfigToUpdate(hostDraft);
   }
 
+  async function connectToLocalHostClient() {
+    const localConnection = await issueLocalHostConnection();
+    setServerUrl(localConnection.serverUrl);
+    setDeviceLabel(localConnection.deviceLabel);
+    setBearerToken(localConnection.bearerToken);
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await connectGatewayWithCredentials(
+        localConnection.serverUrl,
+        localConnection.bearerToken,
+      );
+      if (useSessionStore.getState().remote.connectionStatus === "connected") {
+        return;
+      }
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 750);
+      });
+    }
+
+    throw new Error("Local host started, but the client could not connect yet.");
+  }
+
+  async function refreshHostStatus() {
+    try {
+      syncHostSnapshot(await getHostStatus());
+    } catch (error) {
+      setHostLastError(errorMessage(error, "Failed to refresh host status"));
+    }
+  }
+
+  async function applyHostConfig() {
+    try {
+      const request = hostDraftToUpdate();
+      const snapshot =
+        hostRuntimeStatus === "running"
+          ? await restartHost(request)
+          : await updateHostConfig(request);
+      syncHostSnapshot(snapshot);
+      if (selectedMode === "local_host_client" && snapshot.status === "running") {
+        await connectToLocalHostClient();
+      }
+    } catch (error) {
+      setHostLastError(errorMessage(error, "Failed to update host config"));
+    }
+  }
+
+  async function startLocalHostFromView() {
+    setBusyAction("host-start");
+    try {
+      const snapshot = await startHost(hostDraftToUpdate());
+      syncHostSnapshot(snapshot);
+      if (selectedMode === "local_host_client") {
+        await connectToLocalHostClient();
+      }
+    } catch (error) {
+      const message = errorMessage(error, "Failed to start local host");
+      setHostLastError(message);
+      pushRuntimeLog("error", message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function stopLocalHostFromView() {
+    try {
+      if (selectedMode === "local_host_client") {
+        disconnectGateway();
+      }
+      syncHostSnapshot(await stopHost());
+    } catch (error) {
+      setHostLastError(errorMessage(error, "Failed to stop local host"));
+    }
+  }
+
+  async function restartLocalHostFromView() {
+    setBusyAction("host-restart");
+    try {
+      const snapshot = await restartHost(hostDraftToUpdate());
+      syncHostSnapshot(snapshot);
+      if (selectedMode === "local_host_client") {
+        await connectToLocalHostClient();
+      }
+    } catch (error) {
+      const message = errorMessage(error, "Failed to restart local host");
+      setHostLastError(message);
+      pushRuntimeLog("error", message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleModeSelection(nextMode: AppMode) {
+    if (nextMode !== "remote_client" && !localHostControlsAvailable) {
+      setLastError("Local Host modes are only available inside the desktop app shell.");
+      return;
+    }
+
+    setMode(nextMode);
+    modeBootstrapRef.current = null;
+
+    if (nextMode === "remote_client") {
+      setActivePage("workbench");
+      disconnectGateway();
+      try {
+        syncHostSnapshot(await stopHost());
+      } catch (error) {
+        pushRuntimeLog("error", errorMessage(error, "Failed to stop local host"));
+      }
+      return;
+    }
+
+    if (nextMode === "local_host") {
+      disconnectGateway();
+      setActivePage("host");
+      return;
+    }
+
+    setActivePage("workbench");
+  }
+
+  const desktopPage = activePage === "host" ? "host" : activePage;
+  const mobilePage = activePage === "settings" ? "settings" : "workbench";
+  const currentPage = isCompactLayout ? mobilePage : desktopPage;
+  const topbarCopy =
+    currentPage === "host"
+      ? {
+          title: "Local host on this Mac",
+          subtitle: "Run MyCodex locally, control access, and share it on your LAN when you want to.",
+        }
+      : currentPage === "settings"
+        ? {
+            title: "Connection settings",
+            subtitle: "Server URL, pairing, tokens, and diagnostics live here instead of the main workbench.",
+          }
+        : {
+            title: "Workspace",
+            subtitle: "Switch repos, continue threads, and send the next task without leaving the main work area.",
+          };
+
   return (
-    <main className="shell">
-      <section className="hero">
-        <div className="hero-copy">
-          <p className="eyebrow">MyCodex Desktop</p>
-          <h1>Remote APP control for repo, thread, run, and approvals.</h1>
-          <p className="lede">
-            The desktop client talks to the daemon over HTTP and WebSocket, keeps APP
-            threads isolated from Telegram, and exposes live run output plus approval
-            controls in one surface.
-          </p>
+    <main className="shell app-shell">
+      <header className="app-topbar">
+        <div>
+          <p className="eyebrow">MyCodex App</p>
+          <h1 className="app-title">{topbarCopy.title}</h1>
+          <p className="app-subtitle">{topbarCopy.subtitle}</p>
         </div>
-        <aside className="status-panel">
+        <div className="topbar-status">
           <span className={`status-pill status-${connectionStatus}`}>
             {humanConnectionLabel(connectionStatus)}
           </span>
-          <dl className="status-list">
-            <div>
-              <dt>Server</dt>
-              <dd>{serverUrl || "unset"}</dd>
-            </div>
-            <div>
-              <dt>Token</dt>
-              <dd>{bearerToken ? "stored" : "missing"}</dd>
-            </div>
-            <div>
-              <dt>Selected repo</dt>
-              <dd>{selectedRepo?.name ?? "none"}</dd>
-            </div>
-            <div>
-              <dt>Selected thread</dt>
-              <dd>{selectedThread?.title ?? "none"}</dd>
-            </div>
-          </dl>
-          {lastError ? <p className="error-text">{lastError}</p> : null}
-        </aside>
-      </section>
+          <span className="status-pill status-connecting">{modeLabel(selectedMode)}</span>
+        </div>
+      </header>
 
-      <section className="dashboard">
-        <article className="card">
-          <div className="card-header">
-            <h2>Connection</h2>
-            <span>Daemon + token</span>
-          </div>
-          <label>
-            <span>Daemon URL</span>
-            <input
-              value={serverUrl}
-              onChange={(event) => setServerUrl(event.target.value)}
-              placeholder="http://127.0.0.1:3940"
-            />
-          </label>
-          <label>
-            <span>Device label</span>
-            <input
-              value={deviceLabel}
-              onChange={(event) => setDeviceLabel(event.target.value)}
-              placeholder="MyCodex Desktop"
-            />
-          </label>
-          <label>
-            <span>Bearer token</span>
-            <input
-              value={bearerToken}
-              onChange={(event) => setBearerToken(event.target.value)}
-              placeholder="mcx_..."
-            />
-          </label>
-          <div className="card-actions">
+      <div className="app-frame">
+        {!isCompactLayout ? (
+          <aside className="app-sidebar">
             <button
-              disabled={busyAction === "connect" || connectionStatus === "connected"}
-              onClick={() => void connectGateway()}
+              type="button"
+              className={`nav-link ${desktopPage === "workbench" ? "active" : ""}`}
+              onClick={() => setActivePage("workbench")}
             >
-              {connectionStatus === "connected" ? "Connected" : "Connect"}
-            </button>
-            <button className="ghost" onClick={disconnectGateway}>
-              Disconnect
+              Workbench
             </button>
             <button
-              className="ghost"
-              disabled={connectionStatus !== "connected"}
-              onClick={() =>
-                void refreshRepos().catch((error) => {
-                  const message = errorMessage(error, "Failed to refresh repos");
-                  setLastError(message);
-                  pushRuntimeLog("error", message);
-                })
+              type="button"
+              className={`nav-link ${desktopPage === "settings" ? "active" : ""}`}
+              onClick={() => setActivePage("settings")}
+            >
+              Settings
+            </button>
+            {localHostControlsAvailable ? (
+              <button
+                type="button"
+                className={`nav-link ${desktopPage === "host" ? "active" : ""}`}
+                onClick={() => setActivePage("host")}
+              >
+                Host
+              </button>
+            ) : null}
+          </aside>
+        ) : null}
+
+        <section className="app-main">
+          {(isCompactLayout ? mobilePage : desktopPage) === "workbench" ? (
+            <WorkbenchView
+              compact={isCompactLayout}
+              workspaceLabel={
+                selectedMode === "remote_client" ? "Remote Workspace" : "Local Workspace"
               }
-            >
-              Refresh
-            </button>
-          </div>
-        </article>
-
-        <article className="card">
-          <div className="card-header">
-            <h2>Pairing</h2>
-            <span>CLI approved</span>
-          </div>
-          <p className="muted">
-            Request a short pairing code from the daemon, approve it on the server, and
-            keep polling until the bearer token arrives.
-          </p>
-          <div className="pairing-box">
-            <div>
-              <strong>Code</strong>
-              <span>{pairingSession?.pairingCode ?? "none"}</span>
-            </div>
-            <div>
-              <strong>Status</strong>
-              <span>{pairingSession?.status ?? "idle"}</span>
-            </div>
-            <div>
-              <strong>Expires</strong>
-              <span>{formatTimestamp(pairingSession?.expiresAt)}</span>
-            </div>
-          </div>
-          <div className="card-actions">
-            <button disabled={busyAction === "pairing"} onClick={() => void startPairing()}>
-              Start pairing
-            </button>
-            <button
-              className="ghost"
-              disabled={!pairingSession || busyAction === "pairing-poll"}
-              onClick={() => void pollPairingNow()}
-            >
-              Poll now
-            </button>
-          </div>
-          <p className="hint">
-            Approve with <code>mycodex app pairing approve &lt;CODE&gt;</code>.
-          </p>
-        </article>
-
-        <article className="card tall">
-          <div className="card-header">
-            <h2>Repos</h2>
-            <span>{repos.length} loaded</span>
-          </div>
-          <div className="stack">
-            {repos.length === 0 ? (
-              <p className="empty">Connect to the daemon to load repos.</p>
-            ) : (
-              repos.map((repo) => (
-                <button
-                  key={repo.repo_id}
-                  className={`list-row ${selectedRepoId === repo.repo_id ? "selected" : ""}`}
-                  onClick={() => void handleRepoSelect(repo.repo_id)}
-                >
-                  <strong>{repo.name}</strong>
-                  <span>{describeRepo(repo)}</span>
-                </button>
-              ))
-            )}
-          </div>
-        </article>
-
-        <article className="card tall">
-          <div className="card-header">
-            <h2>Threads</h2>
-            <span>{selectedRepo?.name ?? "Select a repo"}</span>
-          </div>
-          <label>
-            <span>New thread title</span>
-            <input
-              value={threadTitleInput}
-              onChange={(event) => setThreadTitleInput(event.target.value)}
-              placeholder="Optional title"
-            />
-          </label>
-          <div className="card-actions">
-            <button
-              disabled={!selectedRepoId || busyAction === "thread" || connectionStatus !== "connected"}
-              onClick={() => void createThread()}
-            >
-              New thread
-            </button>
-            <button
-              className="ghost"
-              disabled={!selectedRepoId || connectionStatus !== "connected"}
-              onClick={() =>
+              connectionStatus={connectionStatus}
+              repos={repos}
+              repoThreads={repoThreads}
+              selectedRepoId={selectedRepoId}
+              selectedRepoName={selectedRepo?.name ?? null}
+              selectedThread={selectedThread}
+              runtimeLog={runtimeLog}
+              threadTitleInput={threadTitleInput}
+              messageInput={messageInput}
+              busyAction={busyAction}
+              onSelectRepo={(repoId) => void handleRepoSelect(repoId)}
+              onSelectThread={(threadId) => {
+                if (!selectedRepoId) {
+                  return;
+                }
+                selectThread(selectedRepoId, threadId);
+              }}
+              onThreadTitleInputChange={setThreadTitleInput}
+              onMessageInputChange={setMessageInput}
+              onCreateThread={() => void createThread()}
+              onRefreshThreads={() =>
                 selectedRepoId
                   ? void refreshThreads(selectedRepoId).catch((error) => {
                       const message = errorMessage(error, "Failed to refresh threads");
@@ -795,191 +1001,85 @@ export default function App() {
                     })
                   : undefined
               }
-            >
-              Refresh list
-            </button>
-          </div>
-          <div className="stack">
-            {repoThreads.length > 0 ? (
-              repoThreads.map((thread) => (
-                <button
-                  key={thread.local_thread_id}
-                  className={`list-row ${
-                    selectedThread?.local_thread_id === thread.local_thread_id ? "selected" : ""
-                  }`}
-                  onClick={() =>
-                    selectedRepoId ? selectThread(selectedRepoId, thread.local_thread_id) : undefined
-                  }
-                >
-                  <strong>{thread.title}</strong>
-                  <span>
-                    {thread.active_run
-                      ? `Run ${shortId(thread.active_run.turn_id)}`
-                      : thread.status}
-                  </span>
-                </button>
-              ))
-            ) : (
-              <p className="empty">No APP threads for this repo yet.</p>
-            )}
-          </div>
-        </article>
+              onSendMessage={() => void sendMessage()}
+              onAbortRun={() => void abortRun()}
+              onRespondApproval={(decision) => void respondApproval(decision)}
+            />
+          ) : null}
 
-        <article className="card surface output-surface">
-          <div className="card-header">
-            <h2>Run output</h2>
-            <span>{selectedThread?.title ?? "No thread selected"}</span>
-          </div>
-          {selectedThread ? (
-            <>
-              <div className="thread-meta">
-                <div>
-                  <strong>Thread</strong>
-                  <span>{shortId(selectedThread.codex_thread_id)}</span>
-                </div>
-                <div>
-                  <strong>Last used</strong>
-                  <span>{formatTimestamp(selectedThread.last_used_at)}</span>
-                </div>
-                <div>
-                  <strong>Run</strong>
-                  <span>{selectedThread.active_run ? shortId(selectedThread.active_run.turn_id) : "idle"}</span>
-                </div>
-              </div>
+          {(isCompactLayout ? mobilePage : desktopPage) === "settings" ? (
+            <SettingsView
+              mode={selectedMode}
+              allowLocalModes={localHostControlsAvailable}
+              connectionStatus={connectionStatus}
+              serverUrl={serverUrl}
+              deviceLabel={deviceLabel}
+              bearerToken={bearerToken}
+              pairingSession={pairingSession}
+              lastError={lastError}
+              hostStatusLabel={hostRuntimeStatus}
+              selectedRepoName={selectedRepo?.name ?? null}
+              selectedThreadTitle={selectedThread?.title ?? null}
+              busyAction={busyAction}
+              onServerUrlChange={setServerUrl}
+              onDeviceLabelChange={setDeviceLabel}
+              onBearerTokenChange={setBearerToken}
+              onModeChange={(modeValue) => void handleModeSelection(modeValue)}
+              onConnect={() => void connectGateway()}
+              onDisconnect={disconnectGateway}
+              onRefresh={() =>
+                void refreshRepos().catch((error) => {
+                  const message = errorMessage(error, "Failed to refresh repos");
+                  setLastError(message);
+                  pushRuntimeLog("error", message);
+                })
+              }
+              onStartPairing={() => void startPairing()}
+              onPollPairing={() => void pollPairingNow()}
+            />
+          ) : null}
 
-              <div className="composer">
-                <textarea
-                  rows={4}
-                  value={messageInput}
-                  onChange={(event) => setMessageInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                      event.preventDefault();
-                      void sendMessage();
-                    }
-                  }}
-                  placeholder="Send a message into the selected APP thread..."
-                />
-                <div className="card-actions">
-                  <button
-                    disabled={
-                      connectionStatus !== "connected" ||
-                      !selectedRepoId ||
-                      !messageInput.trim() ||
-                      busyAction === "send"
-                    }
-                    onClick={() => void sendMessage()}
-                  >
-                    Send
-                  </button>
-                  <button
-                    className="ghost"
-                    disabled={!selectedThread.active_run?.turn_id || busyAction === "abort"}
-                    onClick={() => void abortRun()}
-                  >
-                    Abort run
-                  </button>
-                </div>
-              </div>
+          {!isCompactLayout && desktopPage === "host" ? (
+            <HostView
+              status={hostRuntimeStatus}
+              lastError={hostLastError}
+              hostDraft={hostDraft}
+              bindAddress={hostConfig.bindAddress}
+              lanAddress={hostConfig.lanAddress}
+              configPath={hostConfig.configPath}
+              logPath={hostConfig.logPath}
+              telegramEnabled={hostConfig.telegramEnabled}
+              recentLogs={host.recentLogs}
+              busyAction={busyAction}
+              onDraftChange={setHostDraft}
+              onApplyConfig={() => void applyHostConfig()}
+              onStartHost={() => void startLocalHostFromView()}
+              onStopHost={() => void stopLocalHostFromView()}
+              onRestartHost={() => void restartLocalHostFromView()}
+              onRefreshHost={() => void refreshHostStatus()}
+            />
+          ) : null}
+        </section>
+      </div>
 
-              <div className="output-grid">
-                <section className="output-panel">
-                  <h3>Assistant</h3>
-                  <pre>{selectedThread.active_run?.assistant_text || "No output yet."}</pre>
-                </section>
-                <section className="output-panel">
-                  <h3>Command output</h3>
-                  <pre>
-                    {selectedThread.active_run?.command_output_tail || "No command output yet."}
-                  </pre>
-                </section>
-                <section className="output-panel full">
-                  <h3>Diff preview</h3>
-                  <pre>{selectedThread.active_run?.diff_preview || "No diff yet."}</pre>
-                </section>
-              </div>
-            </>
-          ) : (
-            <p className="empty">Select a repo and thread to start interacting.</p>
-          )}
-        </article>
-
-        <article className="card">
-          <div className="card-header">
-            <h2>Approval</h2>
-            <span>APP route only</span>
-          </div>
-          {selectedThread?.active_run?.pending_request ? (
-            <>
-              <div className="approval-summary">
-                <p>
-                  <strong>Kind</strong>
-                  <span>{selectedThread.active_run.pending_request.kind}</span>
-                </p>
-                <p>
-                  <strong>Target</strong>
-                  <span>{describePendingRequest(selectedThread.active_run.pending_request)}</span>
-                </p>
-                <p>
-                  <strong>Reason</strong>
-                  <span>{selectedThread.active_run.pending_request.reason || "none"}</span>
-                </p>
-              </div>
-              {selectedThread.active_run.pending_request.kind === "file" ? (
-                <pre className="approval-diff">
-                  {selectedThread.active_run.pending_request.diff_preview || "No diff preview."}
-                </pre>
-              ) : null}
-              <div className="card-actions">
-                <button
-                  disabled={busyAction === "approval"}
-                  onClick={() => void respondApproval("accept")}
-                >
-                  Accept
-                </button>
-                <button
-                  className="ghost"
-                  disabled={busyAction === "approval"}
-                  onClick={() => void respondApproval("decline")}
-                >
-                  Decline
-                </button>
-                <button
-                  className="ghost"
-                  disabled={busyAction === "approval"}
-                  onClick={() => void respondApproval("cancel")}
-                >
-                  Cancel
-                </button>
-              </div>
-            </>
-          ) : (
-            <p className="empty">No approval is pending for the selected thread.</p>
-          )}
-        </article>
-
-        <article className="card">
-          <div className="card-header">
-            <h2>Activity</h2>
-            <span>Most recent first</span>
-          </div>
-          <div className="log">
-            {runtimeLog.length === 0 ? (
-              <p className="empty">No desktop-side activity yet.</p>
-            ) : (
-              runtimeLog.map((entry) => (
-                <div key={entry.id} className={`log-entry log-${entry.level}`}>
-                  <div className="log-heading">
-                    <strong>{entry.level}</strong>
-                    <span>{formatTimestamp(entry.createdAt)}</span>
-                  </div>
-                  <p>{entry.message}</p>
-                </div>
-              ))
-            )}
-          </div>
-        </article>
-      </section>
+      {isCompactLayout ? (
+        <nav className="mobile-tabs" aria-label="Primary pages">
+          <button
+            type="button"
+            className={`nav-link ${mobilePage === "workbench" ? "active" : ""}`}
+            onClick={() => setActivePage("workbench")}
+          >
+            Workbench
+          </button>
+          <button
+            type="button"
+            className={`nav-link ${mobilePage === "settings" ? "active" : ""}`}
+            onClick={() => setActivePage("settings")}
+          >
+            Settings
+          </button>
+        </nav>
+      ) : null}
     </main>
   );
 }

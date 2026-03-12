@@ -110,10 +110,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.telegram.bot_token.trim().is_empty() {
-            bail!("telegram.bot_token must not be empty");
-        }
-        if self.telegram.access_mode == TelegramAccessMode::StaticAllowlist
+        if self.telegram.is_enabled()
+            && self.telegram.access_mode == TelegramAccessMode::StaticAllowlist
             && self.telegram.allowed_user_id.is_none()
         {
             bail!(
@@ -190,6 +188,12 @@ impl TelegramAccessMode {
     }
 }
 
+impl TelegramConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.bot_token.trim().is_empty()
+    }
+}
+
 fn default_codex_bin() -> String {
     "codex".to_string()
 }
@@ -232,4 +236,64 @@ fn default_allow_ssh() -> bool {
 
 fn default_allow_https() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn valid_config() -> Config {
+        let workspace = tempdir().unwrap();
+        let state = tempdir().unwrap();
+
+        Config {
+            workspace: WorkspaceConfig {
+                root: workspace.keep(),
+            },
+            telegram: TelegramConfig {
+                bot_token: String::new(),
+                access_mode: TelegramAccessMode::Pairing,
+                allowed_user_id: None,
+                allowed_chat_id: None,
+                poll_timeout_seconds: 30,
+            },
+            app: AppConfig {
+                enabled: true,
+                bind_addr: "127.0.0.1:3940".into(),
+                public_base_url: String::new(),
+                pairing_code_ttl_sec: 600,
+            },
+            codex: CodexConfig {
+                bin: "codex".into(),
+                model: None,
+                network_access: true,
+            },
+            state: StateConfig { dir: state.keep() },
+            ui: UiConfig {
+                stream_edit_interval_ms: 1_200,
+                max_inline_diff_chars: 6_000,
+            },
+            git: GitConfig {
+                clone_timeout_sec: 600,
+                allow_ssh: true,
+                allow_https: true,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_allows_empty_telegram_token() {
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_requires_allowlist_user_when_telegram_enabled() {
+        let mut config = valid_config();
+        config.telegram.bot_token = "bot-token".into();
+        config.telegram.access_mode = TelegramAccessMode::StaticAllowlist;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("telegram.allowed_user_id is required"));
+    }
 }

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::pending;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -26,8 +27,8 @@ use crate::config::{Config, TelegramAccessMode};
 use crate::repo::{clone_repo, discover_workspace_repos, merge_discovered_repos};
 use crate::state::{AppState, StateStore, ThreadRecord, ThreadSurface};
 use crate::telegram::api::{
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramMessage,
-    Update, default_bot_commands,
+    BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
+    TelegramMessage, Update, default_bot_commands,
 };
 use crate::telegram::render::{
     ProgressView, render_approval_menu, render_approval_remove_menu, render_approval_rules,
@@ -39,7 +40,7 @@ use crate::telegram::render::{
 
 pub struct App {
     config: Config,
-    telegram: TelegramClient,
+    telegram: TelegramBridge,
     state_store: StateStore,
     state: AppState,
     runtimes: HashMap<String, CodexRuntime>,
@@ -115,6 +116,92 @@ struct TelegramApprovalMessage {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+struct TelegramBridge {
+    client: Option<TelegramClient>,
+}
+
+impl TelegramBridge {
+    fn enabled(bot_token: &str) -> Self {
+        Self {
+            client: Some(TelegramClient::new(bot_token)),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self { client: None }
+    }
+
+    async fn set_my_commands(&self, commands: &[BotCommand]) -> Result<()> {
+        match &self.client {
+            Some(client) => client.set_my_commands(commands).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn get_me(&self) -> Result<crate::telegram::api::TelegramUser> {
+        match &self.client {
+            Some(client) => client.get_me().await,
+            None => bail!("telegram is disabled"),
+        }
+    }
+
+    async fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Update>> {
+        match &self.client {
+            Some(client) => client.get_updates(offset, timeout).await,
+            None => pending::<Result<Vec<Update>>>().await,
+        }
+    }
+
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        keyboard: Option<&InlineKeyboardMarkup>,
+    ) -> Result<TelegramMessage> {
+        match &self.client {
+            Some(client) => client.send_message(chat_id, text, keyboard).await,
+            None => bail!("telegram is disabled"),
+        }
+    }
+
+    async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        keyboard: Option<&InlineKeyboardMarkup>,
+    ) -> Result<TelegramMessage> {
+        match &self.client {
+            Some(client) => {
+                client
+                    .edit_message_text(chat_id, message_id, text, keyboard)
+                    .await
+            }
+            None => bail!("telegram is disabled"),
+        }
+    }
+
+    async fn answer_callback_query(&self, query_id: &str, text: Option<&str>) -> Result<()> {
+        match &self.client {
+            Some(client) => client.answer_callback_query(query_id, text).await,
+            None => bail!("telegram is disabled"),
+        }
+    }
+
+    async fn send_document(
+        &self,
+        chat_id: i64,
+        file_path: &Path,
+        caption: &str,
+    ) -> Result<TelegramMessage> {
+        match &self.client {
+            Some(client) => client.send_document(chat_id, file_path, caption).await,
+            None => bail!("telegram is disabled"),
+        }
+    }
+}
+
 impl App {
     pub async fn new(config: Config) -> Result<Self> {
         tokio::fs::create_dir_all(&config.state.dir)
@@ -132,10 +219,16 @@ impl App {
         let _changed = merge_discovered_repos(&mut state, discovered);
         state_store.save(&state)?;
 
-        let telegram = TelegramClient::new(&config.telegram.bot_token);
-        if let Err(err) = telegram.set_my_commands(&default_bot_commands()).await {
-            warn!("failed to register Telegram bot commands: {err}");
-        }
+        let telegram = if config.telegram.is_enabled() {
+            let telegram = TelegramBridge::enabled(&config.telegram.bot_token);
+            if let Err(err) = telegram.set_my_commands(&default_bot_commands()).await {
+                warn!("failed to register Telegram bot commands: {err}");
+            }
+            telegram
+        } else {
+            info!("telegram disabled; skipping bot setup");
+            TelegramBridge::disabled()
+        };
         let (codex_events_tx, codex_events_rx) = mpsc::channel(256);
         let (app_control_tx, app_control_rx) = mpsc::channel(128);
         let app_gateway = if config.app.enabled {
@@ -186,12 +279,16 @@ impl App {
             .await
             .with_context(|| format!("failed to create {}", config.temp_dir().display()))?;
 
-        let telegram = TelegramClient::new(&config.telegram.bot_token);
-        let user = telegram.get_me().await.context("telegram getMe failed")?;
-        info!(
-            "telegram token valid for bot {}",
-            user.username.unwrap_or(user.first_name)
-        );
+        if config.telegram.is_enabled() {
+            let telegram = TelegramBridge::enabled(&config.telegram.bot_token);
+            let user = telegram.get_me().await.context("telegram getMe failed")?;
+            info!(
+                "telegram token valid for bot {}",
+                user.username.unwrap_or(user.first_name)
+            );
+        } else {
+            info!("telegram disabled; skipping Telegram connectivity check");
+        }
 
         probe_codex(&config).await?;
         let discovered = discover_workspace_repos(&config.workspace.root)?;
@@ -294,6 +391,9 @@ impl App {
     }
 
     fn message_access(&self, message: &TelegramMessage) -> MessageAccess {
+        if !self.config.telegram.is_enabled() {
+            return MessageAccess::Denied;
+        }
         let from = match &message.from {
             Some(from) => from,
             None => return MessageAccess::Denied,
@@ -321,6 +421,9 @@ impl App {
     }
 
     fn is_allowed_callback(&self, callback: &CallbackQuery) -> bool {
+        if !self.config.telegram.is_enabled() {
+            return false;
+        }
         match self.config.telegram.access_mode {
             TelegramAccessMode::StaticAllowlist => {
                 if self.config.telegram.allowed_user_id != Some(callback.from.id) {

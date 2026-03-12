@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::app_auth::AppAuthStore;
+use crate::app_auth::AppDeviceRecord;
 use crate::config::Config;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -28,7 +29,16 @@ pub enum AppPairingCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub enum AppDevicesCommand {
     List,
-    Revoke { device_id: String },
+    Create {
+        #[arg(long)]
+        label: String,
+    },
+    Rotate {
+        device_id: String,
+    },
+    Revoke {
+        device_id: String,
+    },
 }
 
 pub fn run_app_command(config_path: PathBuf, command: AppCommand) -> Result<()> {
@@ -55,6 +65,14 @@ pub fn run_app_command(config_path: PathBuf, command: AppCommand) -> Result<()> 
         },
         AppCommand::Devices { command } => match command {
             AppDevicesCommand::List => print_devices(&store)?,
+            AppDevicesCommand::Create { label } => {
+                let (device, token) = store.create_device(&label)?;
+                print_issued_token("Created APP device token.", &device, &token);
+            }
+            AppDevicesCommand::Rotate { device_id } => {
+                let (device, token) = store.rotate_device_token(&device_id)?;
+                print_issued_token("Rotated APP device token.", &device, &token);
+            }
             AppDevicesCommand::Revoke { device_id } => {
                 let device = store.revoke_device(&device_id)?;
                 println!(
@@ -97,6 +115,15 @@ fn print_pairings(store: &AppAuthStore) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_issued_token(prefix: &str, device: &AppDeviceRecord, token: &str) {
+    println!("{prefix}");
+    println!();
+    println!("device_id={}", device.device_id);
+    println!("label={}", device.label);
+    println!("token={token}");
+    println!("warning=This token is shown only once. Save it now.");
 }
 
 fn print_devices(store: &AppAuthStore) -> Result<()> {

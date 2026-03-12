@@ -308,6 +308,45 @@ impl AppAuthStore {
         Ok(state.devices)
     }
 
+    pub fn create_device(&self, label: &str) -> Result<(AppDeviceRecord, String)> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            bail!("device label must not be empty");
+        }
+
+        let mut state = self.load()?;
+        let token = generate_device_token();
+        let device = AppDeviceRecord {
+            device_id: Uuid::new_v4().to_string(),
+            label: trimmed.to_string(),
+            created_at: Utc::now(),
+            last_seen_at: None,
+            revoked_at: None,
+            token_hash: Some(hash_token(&token)),
+        };
+        state.devices.push(device.clone());
+        self.save(&state)?;
+        Ok((device, token))
+    }
+
+    pub fn rotate_device_token(&self, device_id: &str) -> Result<(AppDeviceRecord, String)> {
+        let mut state = self.load()?;
+        let device = state
+            .devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+            .with_context(|| format!("device not found: {device_id}"))?;
+        if device.revoked_at.is_some() {
+            bail!("device is revoked and cannot rotate token: {device_id}");
+        }
+
+        let token = generate_device_token();
+        device.token_hash = Some(hash_token(&token));
+        let device = device.clone();
+        self.save(&state)?;
+        Ok((device, token))
+    }
+
     pub fn revoke_device(&self, device_id: &str) -> Result<AppDeviceRecord> {
         let mut state = self.load()?;
         let device = state
@@ -418,5 +457,64 @@ mod tests {
 
         store.revoke_device(&device.device_id).unwrap();
         assert!(store.authenticate_token(&token).unwrap().is_none());
+    }
+
+    #[test]
+    fn created_device_returns_token_and_persists_only_hash() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_auth.json");
+        let store = AppAuthStore::new(path.clone());
+
+        let (device, token) = store.create_device("Linux admin").unwrap();
+
+        assert_eq!(device.label, "Linux admin");
+        assert_eq!(
+            store.authenticate_token(&token).unwrap().unwrap().device_id,
+            device.device_id
+        );
+
+        let state = store.load().unwrap();
+        let stored = state
+            .devices
+            .iter()
+            .find(|entry| entry.device_id == device.device_id)
+            .unwrap();
+        assert!(stored.token_hash.is_some());
+        assert_ne!(stored.token_hash.as_deref(), Some(token.as_str()));
+
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(!raw.contains(token.as_str()));
+    }
+
+    #[test]
+    fn rotate_device_invalidates_previous_token() {
+        let dir = tempdir().unwrap();
+        let store = AppAuthStore::new(dir.path().join("app_auth.json"));
+
+        let (device, first_token) = store.create_device("Ops laptop").unwrap();
+        let (_device, second_token) = store.rotate_device_token(&device.device_id).unwrap();
+
+        assert_ne!(first_token, second_token);
+        assert!(store.authenticate_token(&first_token).unwrap().is_none());
+        assert_eq!(
+            store
+                .authenticate_token(&second_token)
+                .unwrap()
+                .unwrap()
+                .device_id,
+            device.device_id
+        );
+    }
+
+    #[test]
+    fn revoked_device_cannot_rotate_token() {
+        let dir = tempdir().unwrap();
+        let store = AppAuthStore::new(dir.path().join("app_auth.json"));
+
+        let (device, _token) = store.create_device("Revoked Mac").unwrap();
+        store.revoke_device(&device.device_id).unwrap();
+
+        let error = store.rotate_device_token(&device.device_id).unwrap_err();
+        assert!(error.to_string().contains("cannot rotate token"));
     }
 }

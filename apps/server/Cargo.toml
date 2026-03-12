@@ -1,7 +1,11 @@
 [package]
 name = "mycodex"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
+description = "Run Codex on your own server and control isolated multi-repo sessions from Telegram and app clients"
+license = "MIT"
+repository = "https://github.com/LeoGray/mycodex"
+homepage = "https://github.com/LeoGray/mycodex"
 
 [dependencies]
 anyhow = "1.0.98"
